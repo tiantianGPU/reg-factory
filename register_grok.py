@@ -30,7 +30,7 @@ import requests
 
 from bitbrowser import BitBrowser
 from common.browser import inject_stealth, create_browser_with_retry, human_type
-from common.mailbox import get_code_outlook_pw
+from common.mailbox import get_code_outlook_pw, prelogin_outlook
 from common.cookies import save_platform_cookies
 from common import emails as email_pool
 from common import proxy_switch
@@ -442,9 +442,59 @@ async def dump_state(page, tag=""):
         print(f"  dump_state err: {e}")
 
 
-async def get_code_via_direct_browser(email, email_pw, p):
+async def prelogin_via_direct_browser(email, email_pw, p):
+    """在【提交邮箱发码之前】预登录 Outlook：单开 noproxy 窗口登录+过隐私协议+进收件箱。
+    返回 (bb, pid, page) 句柄给后续 skip_login 轮询复用；失败返回 (None, None, None)。
+    broker 模式不预登录（broker 自管），返回 (None, None, None)。"""
+    import os
+    if os.environ.get("MAILBOX_BROKER"):
+        return None, None, None
+    bb = BitBrowser()
+    pid = None
+    try:
+        pid = create_browser_with_retry(bb, f"mail_{time.strftime('%H%M%S')}")
+        if not pid:
+            return None, None, None
+        bb._post("/browser/update", {
+            "id": pid, "proxyMethod": 2, "proxyType": "noproxy",
+            "browserFingerPrint": {"coreVersion": "130"},
+        })
+        data = None
+        for _ in range(8):
+            try:
+                data = bb.open_browser(pid)
+                break
+            except Exception:
+                await asyncio.sleep(4)
+        if not data:
+            return None, None, None
+        browser = await p.chromium.connect_over_cdp(data["ws"])
+        ctx = browser.contexts[0]
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        await inject_stealth(ctx, page)
+        ok = await prelogin_outlook(page, email, email_pw)
+        if ok:
+            return bb, pid, page
+    except Exception as e:
+        print(f"  [mail] prelogin error: {e}")
+    # 失败：清理窗口
+    if pid:
+        try:
+            bb.close_browser(pid)
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+        try:
+            bb.delete_browser(pid)
+        except Exception:
+            pass
+    return None, None, None
+
+
+async def get_code_via_direct_browser(email, email_pw, p, pre=None):
     """单开一个 noproxy BitBrowser 窗口(本机直连)登录 Outlook 取验证码。
-    注册浏览器走代理过 Grok CF，但 Outlook 界面走代理刷不出，故取信用直连。"""
+    注册浏览器走代理过 Grok CF，但 Outlook 界面走代理刷不出，故取信用直连。
+    pre=(bb,pid,page)：复用 prelogin_via_direct_browser 预登录好的窗口，skip_login 直接轮询。"""
     import os
     if os.environ.get("MAILBOX_BROKER"):
         # broker 模式：委托共享取码服务，不另开浏览器（Grok 用 outlook 注定超时，timeout 调短减少拖累）
@@ -454,6 +504,30 @@ async def get_code_via_direct_browser(email, email_pw, p):
             r"\b((?=[A-Z0-9-]*[A-Z])[A-Z0-9]{2,4}-[A-Z0-9]{2,4})\b", "code",
             int(os.environ.get("GROK_BROKER_TIMEOUT", "40")),
         )
+    # 复用预登录窗口：已在收件箱，skip_login 直接轮询
+    if pre and pre[2] is not None:
+        bb, pid, page = pre
+        try:
+            return await get_code_outlook_pw(
+                page, email, email_pw,
+                sender_hint=GROK_SENDER, subject_hint=GROK_SUBJECT,
+                code_regex=r"\b((?=[A-Z0-9-]*[A-Z])[A-Z0-9]{2,4}-[A-Z0-9]{2,4})\b",
+                max_wait=160, poll=8, skip_login=True,
+            )
+        except Exception as e:
+            print(f"  [mail] reuse prelogin error: {e}")
+            return None
+        finally:
+            if pid:
+                try:
+                    bb.close_browser(pid)
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+                try:
+                    bb.delete_browser(pid)
+                except Exception:
+                    pass
     bb = BitBrowser()
     pid = None
     try:
@@ -632,11 +706,20 @@ async def register_one(index, total, p, node):
 
         # Step 4: 填邮箱
         print("  [4] fill email")
+        pre_mail = None   # 预登录的 Outlook 窗口句柄 (bb,pid,page)
         if email_input:
             await email_input.click()
             await email_input.fill(email)
             await asyncio.sleep(1)
-            # 关键：accounts.x.ai 邮箱提交这一步常带 Turnstile，**不过墙 x.ai 就不发码**
+            # 关键：在提交邮箱（触发 x.ai 发码）【之前】先预登录 Outlook、过隐私协议、进收件箱，
+            # 这样发码后立刻能扫到，避免"发码后才登录、登录耗时错过码"（grok 收不到码的根因）。
+            try:
+                print("  [4] pre-login Outlook (noproxy) before sending code...")
+                pre_mail = await prelogin_via_direct_browser(email, email_pw, p)
+                print(f"  [4] outlook prelogin: {'ready' if pre_mail and pre_mail[2] else 'failed'}")
+            except Exception as e:
+                print(f"  [4] prelogin error: {str(e)[:60]}")
+            # accounts.x.ai 邮箱提交这一步常带 Turnstile，**不过墙 x.ai 就不发码**
             # （表现为"邮件根本没到"）。检测到 widget 就先过墙，再点 Continue。
             if await _has_turnstile_widget(page):
                 print("  [4] 邮箱步检测到 Turnstile，先过墙再提交")
@@ -668,7 +751,7 @@ async def register_one(index, total, p, node):
         # 关键架构：注册浏览器走代理(过Grok CF)，但 Outlook 界面走代理刷不出来，
         # 所以取信单开一个 noproxy 的 BitBrowser 窗口(本机直连)读邮件。
         print("  [5] get verification code via separate noproxy Outlook window")
-        code = await get_code_via_direct_browser(email, email_pw, p)
+        code = await get_code_via_direct_browser(email, email_pw, p, pre=pre_mail)
 
         if code:
             print(f"  got code: {code}")

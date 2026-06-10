@@ -13,6 +13,7 @@ Usage:
 import argparse
 import asyncio
 import json
+import math
 import os
 import random
 import re
@@ -1090,6 +1091,29 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
         if _env_max_press.isdigit():
             max_press = min(max_press, int(_env_max_press))
         no_btn_rounds = 0
+        had_captcha = False          # 是否真的出现过 captcha（避免一上来误判已通过）
+        gone_rounds = 0              # captcha 消失后连续多少轮仍停在 signup（等跳转）
+
+        async def _captcha_visible():
+            """页面上是否还有【可交互】的 PerimeterX 按住验证（按住按钮 / hsprotect iframe）。
+            captcha 通过后会变成 Loading 转圈、这些元素消失 -> 返回 False。"""
+            try:
+                for sel in ['button:has-text("Press and hold")', 'button:has-text("Appuyer et maintenir")',
+                            'button:has-text("按住")', 'button:has-text("长按")',
+                            'button:has-text("Halten")', '#px-captcha']:
+                    el = page.locator(sel).first
+                    if await el.count() > 0:
+                        b = await el.bounding_box()
+                        if b and b['width'] > 30:
+                            return True
+                ifr = page.locator('iframe[src*="hsprotect.net"], iframe[src*="arkose"], iframe[src*="funcaptcha"]')
+                for hi in range(await ifr.count()):
+                    b = await ifr.nth(hi).bounding_box()
+                    if b and b['width'] > 50 and b['height'] > 30:
+                        return True
+            except Exception:
+                pass
+            return False
 
         # headless: 90 s captcha window; browser: 240 s (multiple press rounds)
         _captcha_rounds = 30 if captcha_early_abort else 80
@@ -1114,6 +1138,17 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
                         break
                     continue
 
+            # —— captcha 通过判定（精确按 host）——
+            # 坑：captcha 过后页面跳到 privacynotice.account.microsoft.com/notice?ru=...，
+            # 其 ru= 参数里带 "signup" 字样，旧的裸 "signup" 子串判定 -> 误以为还在 signup
+            # -> 一直 retrying presses 直到超时。改为按真实 host 判断是否已离开 signup 表单。
+            on_signup_form = ("signup.live.com" in current_url) and ("privacynotice" not in current_url)
+            if not on_signup_form and any(h in current_url for h in [
+                    "privacynotice", "account.microsoft.com", "account.live.com",
+                    "outlook.live.com", "outlook.office", "login.live.com/oauth20"]):
+                print(f"  {tag} captcha passed, left signup -> {current_url[:70]}")
+                break
+
             # Success checks
             if "outlook" in current_url and "signup" not in current_url and "login" not in current_url:
                 print(f"  {tag} registration complete!")
@@ -1124,6 +1159,31 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
             if "signup" not in current_url and "live.com" in current_url:
                 print(f"  {tag} left signup: {current_url[:60]}")
                 break
+
+            # captcha 消失判定：过验证后页面变 "Loading..." 转圈、按住按钮/iframe 消失，
+            # 但 URL 可能还没跳转（异步）。此时不该再按压/超时 —— 标记已过，进入等跳转模式。
+            if had_captcha:
+                if await _captcha_visible():
+                    gone_rounds = 0
+                else:
+                    gone_rounds += 1
+                    if gone_rounds == 1:
+                        print(f"  {tag} captcha 元素已消失（验证通过/Loading），等待页面跳转…")
+                    # 轻推一下提交按钮，催收尾
+                    if gone_rounds % 3 == 0:
+                        for sel in ['#iSignupAction', 'input[type="submit"]', 'button[type="submit"]']:
+                            try:
+                                b = page.locator(sel).first
+                                if await b.count() > 0 and await b.is_visible():
+                                    await b.click(timeout=3000); break
+                            except Exception:
+                                pass
+                    # 等够 ~20 轮(≈60s)仍没跳转，去 post-captcha 收尾兜底（不再傻等超时）
+                    if gone_rounds >= 20:
+                        print(f"  {tag} captcha 已过但久未跳转，进入收尾流程")
+                        break
+                    await asyncio.sleep(3)
+                    continue
 
             # Account blocked detection (CN/EN/FR)
             if any(kw in page_text for kw in [
@@ -1179,56 +1239,50 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
                 pressed = False
                 target_box = None
 
-                # First: try main-page "press and hold" button (multi-language)
-                for hold_sel in [
-                    'button:has-text("Appuyer et maintenir")',
-                    'button:has-text("Press and hold")',
-                    'button:has-text("按住不放")',
-                    'button:has-text("长按")',
-                    'button:has-text("Halten")',
-                    '#px-captcha',
-                ]:
+                # 定位「按住」按钮。诊断已确认：按钮是可见 hsprotect iframe 内的 #px-captcha
+                # 元素(box 如 y485~527,height 42)，page.locator 穿不进跨域 iframe，必须遍历
+                # page.frames 在 frame 内取 #px-captcha 的真实坐标。优先用它(box_is_button=True)，
+                # 拿不到才退回整个 iframe 框按比例。
+                box_is_button = False
+                # 1) frame 内真按钮 #px-captcha（取可见的那个 frame：width>0）
+                for f in page.frames:
+                    if f == page.main_frame or 'hsprotect.net' not in (f.url or ''):
+                        continue
                     try:
-                        hold_btn = page.locator(hold_sel).first
-                        if await hold_btn.count() > 0:
-                            target_box = await hold_btn.bounding_box()
-                            if target_box and target_box['width'] > 30:
-                                print(f"  {tag} found main-page hold button: {hold_sel}")
+                        px = f.locator('#px-captcha').first
+                        if await px.count() > 0:
+                            b = await px.bounding_box()
+                            if b and b['width'] > 30 and b['height'] > 8:
+                                target_box = b; box_is_button = True
                                 break
-                            target_box = None
                     except Exception:
                         pass
-
-                # Fallback: iframe-based PerimeterX
+                # 2) 退回整个可见 hsprotect iframe 框
                 if not target_box:
                     try:
-                        hs_iframes = page.locator('iframe[src*="hsprotect.net"]')
-                        for hi in range(await hs_iframes.count()):
-                            box = await hs_iframes.nth(hi).bounding_box()
-                            if box and box['width'] > 50 and box['height'] > 30:
-                                target_box = box
+                        hs = page.locator('iframe[src*="hsprotect.net"]')
+                        for hi in range(await hs.count()):
+                            b = await hs.nth(hi).bounding_box()
+                            if b and b['width'] > 50 and b['height'] > 30:
+                                target_box = b
                                 break
                     except Exception:
                         pass
 
-                if not target_box:
-                    try:
-                        for f in page.frames:
-                            if 'hsprotect.net' in (f.url or '') and 'ch_ctx' in (f.url or ''):
-                                px = f.locator('#px-captcha')
-                                if await px.count() > 0:
-                                    target_box = await px.bounding_box()
-                                    break
-                    except Exception:
-                        pass
-
-                if target_box and target_box['width'] > 30 and target_box['height'] > 10:
+                if target_box and target_box['width'] > 30 and target_box['height'] >= 8:
                     press_count += 1
                     pressed = True
+                    had_captcha = True   # 出现过 captcha，供「消失=已通过」判定使用
                     bx, by, bw, bh = target_box['x'], target_box['y'], target_box['width'], target_box['height']
-                    cx = bx + bw * random.uniform(0.35, 0.65)
-                    cy = by + bh * random.uniform(0.4, 0.7)
-                    print(f"  {tag} press #{press_count}: ({cx:.0f},{cy:.0f})")
+                    if box_is_button:
+                        # target_box 就是真按钮 #px-captcha：按其中心 + 小随机抖动
+                        cx = bx + bw * random.uniform(0.40, 0.60)
+                        cy = by + bh * random.uniform(0.40, 0.60)
+                    else:
+                        # 退回整个 iframe 框：按钮在中部窄带（实测 0.48-0.62 命中）
+                        cx = bx + bw * random.uniform(0.42, 0.58)
+                        cy = by + bh * random.uniform(0.48, 0.62)
+                    print(f"  {tag} press #{press_count}: ({cx:.0f},{cy:.0f}){' [btn]' if box_is_button else ' [box]'}")
 
                     # Bezier mouse movement
                     sx, sy = random.uniform(200, 800), random.uniform(200, 400)
@@ -1247,16 +1301,37 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
                     await asyncio.sleep(random.uniform(0.1, 0.3))
                     await page.mouse.down()
 
-                    hold_time = random.uniform(8, 18)
+                    # 拟人按住：关键是按住到进度条走满(captcha 消失)才松手 —— 不能固定短时长，
+                    # 太短(3-5s)进度没满就松手 => 不过。策略：持续按住并每 ~0.5s 检测 captcha 是否
+                    # 消失(进度满/通过)，一消失立刻松手；设一个较长上限(~14s)兜底防止卡死。
+                    max_hold = random.uniform(11.0, 15.0)
                     hold_start = asyncio.get_event_loop().time()
-                    while asyncio.get_event_loop().time() - hold_start < hold_time:
-                        # Minimal micro-tremor to simulate human hand
-                        await page.mouse.move(cx + random.uniform(-0.8, 0.8), cy + random.uniform(-0.8, 0.8))
-                        await asyncio.sleep(random.uniform(0.08, 0.25))
+                    drift_phase = random.uniform(0, 2 * math.pi)
+                    drift_freq = random.uniform(1.5, 2.8)
+                    last_chk = 0.0
+                    passed_in_hold = False
+                    while True:
+                        elapsed = asyncio.get_event_loop().time() - hold_start
+                        if elapsed >= max_hold:
+                            break
+                        ph = drift_phase + elapsed * drift_freq
+                        await page.mouse.move(cx + 1.0 * math.sin(ph), cy + 0.6 * math.cos(ph * 1.3))
+                        # 进度满后 captcha 消失就松手（但至少按住 1.5s，避免误判刚加载的空隙）
+                        if elapsed > 1.5 and elapsed - last_chk > 0.5:
+                            last_chk = elapsed
+                            try:
+                                if not await _captcha_visible():
+                                    passed_in_hold = True
+                                    break
+                            except Exception:
+                                pass
+                        await asyncio.sleep(random.uniform(0.03, 0.08))
 
+                    await asyncio.sleep(random.uniform(0.05, 0.18))
                     await page.mouse.up()
-                    print(f"  {tag} held {hold_time:.1f}s")
-                    await asyncio.sleep(random.uniform(3, 6))
+                    held = asyncio.get_event_loop().time() - hold_start
+                    print(f"  {tag} held {held:.1f}s{' (passed)' if passed_in_hold else ''}")
+                    await asyncio.sleep(random.uniform(2, 4))
 
                     try:
                         await page.screenshot(path=f"{SCREENSHOT_DIR}/outlook_{idx}_hold_{press_count}.png")
@@ -1325,61 +1400,21 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
                 except Exception:
                     pass
 
-            # CAPTCHA solver APIs
+            # 按满次数：两个打码器(capsolver-px/ezcaptcha-px)对 MS 这个 PerimeterX
+            # 按住验证都没用(类型不支持/解不出)，已移除。按满后给一个短观察窗等跳转：
+            # 若手动按住其实已过，循环顶部「captcha 消失=已通过」会接管收尾；若仍可见(没过)，
+            # 观察窗内不再按压、等满 ~24s 就快速放弃，不空等到 captcha timeout。
             if press_count >= max_press and not arkose_solved:
-                print(f"  {tag} trying captcha solvers...")
-
-                # 1. CapSolver PerimeterX (best option — set CAPSOLVER_API_KEY to enable)
-                if CAPSOLVER_API_KEY:
-                    px_solution = await solve_perimeterx_capsolver(page, context, page_url=page.url)
-                    if px_solution and isinstance(px_solution, dict):
-                        try:
-                            for key in ['_px2', '_pxhd', '_pxCaptcha', '_px3', '_pxvid', '_pxde']:
-                                if key in px_solution:
-                                    await context.add_cookies([{
-                                        "name": key, "value": str(px_solution[key]),
-                                        "domain": ".live.com", "path": "/",
-                                    }])
-                            await page.reload(timeout=15000)
-                            await asyncio.sleep(5)
-                            arkose_solved = True
-                            continue
-                        except Exception:
-                            pass
-
-                # 2. EZ-Captcha PerimeterX (rarely supported)
-                if not arkose_solved:
-                    px_solution = solve_perimeterx_ezcaptcha(page_url=page.url)
-                    if px_solution and isinstance(px_solution, dict):
-                        try:
-                            for key in ['_pxCaptcha', '_px3', '_px2', '_pxhd', '_pxvid', '_pxde']:
-                                if key in px_solution:
-                                    await context.add_cookies([{
-                                        "name": key, "value": str(px_solution[key]),
-                                        "domain": ".live.com", "path": "/",
-                                    }])
-                            token_val = px_solution.get("token") or px_solution.get("uuid")
-                            if token_val:
-                                await inject_arkose_token(page, str(token_val))
-                            await page.reload(timeout=15000)
-                            await asyncio.sleep(5)
-                            arkose_solved = True
-                            continue
-                        except Exception:
-                            pass
-
-                # None of the solvers worked.
-                if captcha_early_abort:
-                    # Headless mode: abort now so auto-mode can fall back to
-                    # BitBrowser without burning the full captcha timeout.
-                    arkose_solved = True
-                    print(f"  {tag} captcha solvers unavailable — aborting early")
-                    return None, None
-                else:
-                    # Browser/BitBrowser mode: reset counter so pressing continues.
-                    # max_press is already 15 for browser mode; just reset progress.
-                    press_count = 0
-                    print(f"  {tag} captcha solvers unavailable — retrying presses")
+                arkose_solved = True
+                arkose_wait_start = wait_round
+                print(f"  {tag} 按满 {max_press} 次，停止按压，等待页面跳转")
+            if arkose_solved and had_captcha:
+                # 仍能看到 captcha = 没过；给 8 轮(~24s)缓冲后快速放弃
+                if await _captcha_visible():
+                    if wait_round - arkose_wait_start >= 8:
+                        print(f"  {tag} 按满仍未通过，快速放弃本号")
+                        await page.screenshot(path=f"{SCREENSHOT_DIR}/outlook_{idx}_press_fail.png")
+                        return None, None
 
             if wait_round % 5 == 0:
                 await page.screenshot(path=f"{SCREENSHOT_DIR}/outlook_{idx}_wait_{wait_round}.png")
@@ -1394,7 +1429,10 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
         # Post-captcha pages
         for retry in range(10):
             current_url = page.url.lower()
-            if "privacynotice" not in current_url and "signup" not in current_url:
+            # 精确判断：已离开 signup 表单且不在隐私声明页 = 收尾完成（同样避免 ru= 里
+            # 的 "signup" 子串误伤）。
+            on_signup_form = ("signup.live.com" in current_url) and ("privacynotice" not in current_url)
+            if not on_signup_form and "privacynotice" not in current_url:
                 break
             for label in ['OK', 'Accept', 'Continue', 'Next', 'I agree', 'Got it', 'Agree']:
                 btn = page.locator(f'button:has-text("{label}"), input[value="{label}"], a:has-text("{label}")').first

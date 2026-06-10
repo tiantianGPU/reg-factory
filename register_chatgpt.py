@@ -24,7 +24,7 @@ sys.path.insert(0, ".")
 from playwright.async_api import async_playwright
 
 from common.browser import open_and_connect, teardown, human_type, react_fill
-from common.mailbox import get_code_by_token, get_code_outlook_pw
+from common.mailbox import get_code_by_token, get_code_outlook_pw, prelogin_outlook
 from common.cookies import save_platform_cookies
 from common import emails as email_pool
 
@@ -165,11 +165,16 @@ async def fill_email_verified(page, email_input, email, tries=4):
     所以这里每轮**先关横幅再填**，填完若横幅仍在则再关一次并重填。"""
     sel = 'input[type="email"], input[name="email"]'
     for i in range(tries):
-        # 先关横幅（可能这轮才弹出来），再填——避免横幅抢焦点导致键盘输入落空
+        # 1) 先关横幅（可能这轮才弹出来）
         await dismiss_cookie_banner(page)
+        # 2) 等横幅真正消失/页面稳定再填——横幅抢焦点会让键盘输入落空，必须等它落定
+        await asyncio.sleep(0.8)
+        await dismiss_cookie_banner(page)
+        # 3) 填邮箱（React 受控输入）
         if await react_fill(page, sel, email, tries=2, verbose=False):
-            # 二次确认：横幅若此刻才冒出来盖住，关掉它并回读校验，防 setter 误报
+            # 4) 填完立即确认：横幅若此刻才冒出来盖住，关掉它并回读校验，防 setter 误报
             await dismiss_cookie_banner(page)
+            await asyncio.sleep(0.3)
             try:
                 if (await page.locator(sel).first.input_value()).strip() == email:
                     return True
@@ -260,8 +265,12 @@ async def register_one(index, total, p):
         await asyncio.sleep(5)
         await dump_state(page, "after-load")
 
-        # Step 1.5: 关掉 cookie 同意横幅（弹出时会挡住/抢焦点，导致邮箱填不进去 -> "邮箱必填"）
+        # Step 1.5: 先关 cookie 同意横幅（弹出时会挡住/抢焦点，导致邮箱填不进去 -> "邮箱必填"）
         await dismiss_cookie_banner(page)
+        # 关横幅后等页面稳定：横幅消失会触发重排/下拉渲染，等它落定再填，避免填到一半被重排打断
+        await asyncio.sleep(1.2)
+        await dismiss_cookie_banner(page)   # 横幅有时分两次弹，再补关一次
+        await asyncio.sleep(0.6)
 
         # Step 2: 填邮箱 -> Continue
         print("  [2] fill email")
@@ -271,7 +280,7 @@ async def register_one(index, total, p):
             await page.screenshot(path=f"screenshots/chatgpt_noemail_{index}.png")
             email_pool.mark_error(PLATFORM, email, email_pw, "no_email_input")
             return None
-        # 填后回读校验：没真正进去就重填，避免空提交
+        # 填邮箱（内部：每轮先关横幅再填，填完回读确认；见 fill_email_verified）
         if not await fill_email_verified(page, email_input, email):
             print("  [2] email fill failed after retries")
         # 提交前最后一道：关横幅（可能此刻才弹），并回读确认邮箱真在框里，否则再补填一次
@@ -282,6 +291,22 @@ async def register_one(index, total, p):
                 await fill_email_verified(page, email_input, email, tries=2)
         except Exception:
             pass
+        # 关键优化：在提交邮箱（触发 OpenAI 发码）【之前】先把 Outlook 登录好、过隐私协议、
+        # 停在收件箱。这样提交后码一到立刻能扫到，避免"发码后才登录、登录+过协议耗时错过码"。
+        # 注意：必须用【独立 BitBrowser 窗口】预登录，绝不能在注册 ctx 里 new_page —— 同 context
+        # 开 Outlook + bring_to_front 会干扰注册标签的 auth.openai.com 会话，导致点 Continue 后
+        # ERR_CONNECTION_CLOSED。故另开窗口隔离（与 grok 的 noproxy 取码窗口同理）。
+        mail_bb = mail_pid = mail_page = None
+        prelogged = False
+        if email_pw:
+            try:
+                print("  [2.5] pre-login Outlook (独立窗口) before sending code...")
+                mail_bb, mail_pid, _mb, _mctx, mail_page = await open_and_connect(
+                    name=f"mail_{time.strftime('%m%d_%H%M%S')}_{index}", p=p)
+                prelogged = await prelogin_outlook(mail_page, email, email_pw)
+                print(f"  [2.5] outlook prelogin: {'ready' if prelogged else 'failed'}")
+            except Exception as e:
+                print(f"  [2.5] prelogin error: {str(e)[:60]}")
         # 提交：按钮文本中/英/日多语言精确匹配，避免点到 Continue with Google/Apple
         if not await click_any_exact(page, ["Continue", "続行", "继续", "繼續", "Next", "下一步", "Teruskan"]):
             sub = page.locator('button[type="submit"]')
@@ -345,20 +370,36 @@ async def register_one(index, total, p):
                 OAI_SENDER, OAI_SUBJECT, r"\b(\d{6})\b", 40, 5
             )
             if not code and email_pw:
-                print("  [4] token failed, trying browser login to Outlook...")
-                mail_page = await ctx.new_page()
-                try:
-                    code = await get_code_outlook_pw(
-                        mail_page, email, email_pw,
-                        sender_hint=("openai", "noreply", "no-reply"),
-                        subject_hint=("code", "verify", "openai", "chatgpt", "验证"),
-                        code_regex=r"\b(\d{6})\b", max_wait=150, poll=8,
-                    )
-                finally:
+                # 复用 Step 2.5 预登录好的独立窗口（已在收件箱），skip_login 直接轮询取码；
+                # 预登录失败/没开成则另开独立窗口走完整登录兜底（绝不用注册 ctx，避免干扰）。
+                reuse = prelogged and mail_page is not None
+                if reuse:
+                    print("  [4] token failed, polling pre-logged Outlook inbox...")
+                else:
+                    print("  [4] token failed, opening Outlook window to get code...")
                     try:
-                        await mail_page.close()
-                    except Exception:
-                        pass
+                        mail_bb, mail_pid, _mb, _mctx, mail_page = await open_and_connect(
+                            name=f"mail_{time.strftime('%m%d_%H%M%S')}_{index}", p=p)
+                    except Exception as e:
+                        print(f"  [4] open mail window failed: {str(e)[:60]}")
+                        mail_page = None
+                if mail_page is not None:
+                    try:
+                        code = await get_code_outlook_pw(
+                            mail_page, email, email_pw,
+                            sender_hint=("openai", "noreply", "no-reply"),
+                            subject_hint=("code", "verify", "openai", "chatgpt", "验证"),
+                            code_regex=r"\b(\d{6})\b", max_wait=150, poll=8,
+                            skip_login=reuse,
+                        )
+                    finally:
+                        # 关掉独立取码窗口（teardown 删 BitBrowser profile）
+                        if mail_bb and mail_pid:
+                            try:
+                                await teardown(mail_bb, mail_pid, delete=True)
+                            except Exception:
+                                pass
+                        mail_bb = mail_pid = mail_page = None
                 # 切回注册标签
                 await page.bring_to_front()
             if code:
@@ -390,6 +431,13 @@ async def register_one(index, total, p):
                 print("  no code received")
                 # 收不到码：只从 chatgpt 平台拉黑（记 emails_error_chatgpt.txt），其它平台仍可取
                 email_pool.mark_error(PLATFORM, email, email_pw, "no_code")
+        # 兜底：关掉可能残留的预登录邮箱独立窗口（如 token 路径直接拿到码、或没进验证码分支）
+        if mail_bb and mail_pid:
+            try:
+                await teardown(mail_bb, mail_pid, delete=True)
+            except Exception:
+                pass
+            mail_bb = mail_pid = mail_page = None
         check_timeout()
 
         # Step 5: onboarding（名字/生日）

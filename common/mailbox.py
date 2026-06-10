@@ -178,24 +178,42 @@ async def _outlook_login(page, email, password):
             await asyncio.sleep(5)
 
         # 密码提交后会出现若干中间页，逐个处理（轮询几轮，每轮点掉一个）：
+        #  - 隐私/服务协议同意页 (Review your privacy / 隐私声明 / Accept and continue): 点 接受/同意/继续
         #  - "保持登录状态吗?" (Stay signed in / 保持登录): 点 是/Yes/继续/Continue
         #  - passkey 设置页 (Set up passkey / パスキー): 点 跳过/Skip/稍后/Not now
         #  - 其它确认页: 点 继续/确认/OK
-        affirm = ["Yes", "是", "はい", "Sí", "Continue", "继续", "繼續", "確認", "确认", "OK", "Accept", "确定"]
+        affirm = ["Accept and continue", "Accept", "Agree and continue", "I agree", "Agree",
+                  "Looks good", "接受并继续", "接受", "同意并继续", "同意", "繼續使用", "继续使用",
+                  "Yes", "是", "はい", "Sí", "Continue", "继续", "繼續", "確認", "确认",
+                  "OK", "确定", "Next", "下一步", "Got it", "知道了"]
         skip = ["Skip", "跳过", "跳過", "Not now", "稍后", "稍後", "後で", "Maybe later", "今はしない", "暂时跳过"]
-        for _ in range(4):
+        for _ in range(6):
             await asyncio.sleep(2)
             # 已经进入邮箱就停
             if "outlook" in (page.url or "") and "live.com/mail" in (page.url or ""):
                 break
+            cur_url = (page.url or "").lower()
             body = ""
             try:
-                body = (await page.locator("body").inner_text())[:300].lower()
+                body = (await page.locator("body").inner_text())[:400].lower()
             except Exception:
                 pass
-            # passkey/设置页优先点跳过
             clicked = False
-            if any(k in body for k in ["passkey", "パスキー", "通行密钥", "密钥", "set up", "设置"]):
+            # 隐私/服务协议同意页（URL 或正文命中）：必须先点同意才能进邮箱
+            if ("privacynotice" in cur_url or "privacy" in cur_url
+                    or any(k in body for k in ["privacy statement", "review your privacy", "terms of use",
+                                               "隐私声明", "隐私权", "查看您的隐私", "服务协议", "服務協定",
+                                               "我们重视您的隐私", "review the updated"])):
+                for label in ["Accept and continue", "Accept", "Agree and continue", "I agree", "Agree",
+                              "接受并继续", "接受", "同意并继续", "同意", "Continue", "继续", "繼續", "Next", "OK"]:
+                    b = page.locator(f'button:has-text("{label}"), input[value="{label}"], a:has-text("{label}")').first
+                    if await b.count() > 0:
+                        try:
+                            await b.click(timeout=3000); clicked = True; await asyncio.sleep(2); break
+                        except Exception:
+                            pass
+            # passkey/设置页优先点跳过
+            if not clicked and any(k in body for k in ["passkey", "パスキー", "通行密钥", "密钥", "set up", "设置"]):
                 for label in skip:
                     b = page.locator(f'button:has-text("{label}"), a:has-text("{label}")').first
                     if await b.count() > 0:
@@ -218,6 +236,33 @@ async def _outlook_login(page, email, password):
     except Exception as e:
         print(f"  [mail-pw] login error: {e}")
         return False
+
+
+async def _dismiss_inbox_popup(page):
+    """关掉进收件箱后弹出的对话框/横幅：
+    - 通知权限 "允许/Allow"、"打开/Turn on"，或 "稍后/Not now/暂时不/Dismiss/关闭/Got it"。
+    - Outlook 的 "立即体验新版/继续/Skip" 引导弹窗。
+    弹窗会盖住邮件列表导致扫不到验证码，先点掉。命中一个就返回。"""
+    labels = ["Allow", "允许", "Turn on", "打开", "Yes", "是",
+              "Not now", "稍后", "稍後", "暂时不", "暫時不", "Maybe later", "後で",
+              "Dismiss", "关闭", "關閉", "Got it", "知道了", "OK", "Skip", "跳过", "跳過",
+              "Continue", "继续", "繼續", "No thanks", "不用了"]
+    try:
+        for label in labels:
+            b = page.locator(
+                f'[role="dialog"] button:has-text("{label}"), '
+                f'button:has-text("{label}"), a:has-text("{label}")'
+            ).first
+            if await b.count() > 0 and await b.is_visible():
+                try:
+                    await b.click(timeout=2500)
+                    await asyncio.sleep(1)
+                    return True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return False
 
 
 async def _click_folder(page, folder_names):
@@ -252,11 +297,14 @@ def _first_group(m):
 
 async def _scan_current_folder(page, pat, sender_hint, subject_hint):
     """在当前已打开的 Outlook 文件夹里找目标邮件并提验证码。
-    策略（从稳到松，应对'邮件就在垃圾箱却读不到'）：
-      1) 直接扫列表项预览文本，命中码正则就返回（Outlook 预览常含 'code is 123456'）；
-      2) 点开发件人/主题命中的最新一封，读正文取码；
-      3) 仍无命中则点开最顶部(最新)一封兜底 —— 刚触发发送，最新即目标。"""
-    hints = [h.lower() for h in (sender_hint + subject_hint)]
+    关键修复：必须先命中发件人/主题(hints)的邮件，再从它提码 —— 不能无差别扫顶部邮件，
+    否则会抓到收件箱里旧邮件/欢迎邮件里的数字，返回错误验证码。
+    策略：
+      1) 只在「命中 hints 的列表项」预览文本里找码（命中即返回，避免点开等待）；
+      2) 没在预览里找到 -> 点开命中 hints 的最新一封，读正文取码；
+      3) 完全没有命中 hints 的邮件 -> 返回 None（让外层继续轮询等目标邮件到达），
+         不再用'点开最顶部一封'兜底（那是抓错码的元凶）。"""
+    hints = [h.lower() for h in (sender_hint + subject_hint) if h]
     # 等邮件列表渲染（[role=option] 是收件箱+垃圾箱通用的邮件项）
     for _ in range(8):
         await asyncio.sleep(2)
@@ -269,30 +317,38 @@ async def _scan_current_folder(page, pat, sender_hint, subject_hint):
     else:
         return None
 
-    # 1) 预览文本直接取码（顶部最新几封，避免抓到旧码）
+    # 1) 只在命中 hints 的列表项预览里取码（顶部最新 8 封内）
     try:
-        previews = await page.evaluate(
-            """() => [...document.querySelectorAll('[role="option"]')].slice(0,5)
-                     .map(it => (it.textContent||''))"""
+        hit_previews = await page.evaluate(
+            """(hints) => {
+                const items = [...document.querySelectorAll('[role="option"]')].slice(0, 8);
+                const out = [];
+                for (const it of items) {
+                    const t = (it.textContent || '');
+                    const tl = t.toLowerCase();
+                    if (hints.some(h => tl.includes(h))) out.push(t);
+                }
+                return out;
+            }""",
+            hints,
         )
     except Exception:
-        previews = []
-    for txt in previews:
+        hit_previews = []
+    for txt in hit_previews:
         m = pat.search(txt)
         if m:
             return _first_group(m)
 
-    # 2)/3) 选要点开的邮件：优先发件人/主题命中的最新一封，否则点最顶部(最新)一封
+    # 2) 点开命中 hints 的【最新】一封，读正文取码（列表按时间倒序，第一封命中即最新）
     try:
         clicked = await page.evaluate(
             """(hints) => {
                 const items = [...document.querySelectorAll('[role="option"]')];
-                for (const it of items) {  // 列表按时间倒序，第一封命中即最新
+                for (const it of items) {
                     const t = (it.textContent || '').toLowerCase();
-                    if (hints.some(h => h && t.includes(h))) { it.click(); return (it.textContent||'').slice(0,80); }
+                    if (hints.some(h => t.includes(h))) { it.click(); return (it.textContent||'').slice(0,80); }
                 }
-                if (items.length) { items[0].click(); return '[fallback-newest] ' + (items[0].textContent||'').slice(0,60); }
-                return null;
+                return null;   // 没有命中 hints 的邮件：不点开任何邮件，返回让外层继续轮询
             }""",
             hints,
         )
@@ -345,6 +401,21 @@ async def fetch_from_broker(email, password, sender_hint, subject_hint, regex, k
         return None
 
 
+async def prelogin_outlook(page, email, password):
+    """预登录 Outlook：登录 + 过隐私协议/passkey + 进收件箱，停在邮箱就绪状态。
+    用法：在触发发码（如 chatgpt 提交邮箱）【之前】先调用它，等码一到立刻能扫到，
+    避免"发码后才登录、登录+过协议耗时导致错过/超时"。返回是否就绪。"""
+    if not await _outlook_login(page, email, password):
+        return False
+    try:
+        await page.goto("https://outlook.live.com/mail/0/", timeout=60000)
+        await asyncio.sleep(6)
+    except Exception:
+        pass
+    await _dismiss_inbox_popup(page)   # 关掉通知权限/引导弹窗，免得盖住邮件列表
+    return True
+
+
 async def get_code_outlook_pw(
     page,
     email,
@@ -354,21 +425,25 @@ async def get_code_outlook_pw(
     code_regex=r"\b(\d{6})\b",
     max_wait=150,
     poll=8,
+    skip_login=False,
 ):
     """浏览器登录 Outlook 取 6 位验证码（refresh_token 失效时用）。
     通过点击左侧文件夹切换 inbox/junk（直接 goto junk URL 列表为空）。
-    page: BitBrowser 里新开的一个标签。返回 code 或 None。"""
+    page: BitBrowser 里新开的一个标签。返回 code 或 None。
+    skip_login=True 时跳过登录+进收件箱（已用 prelogin_outlook 预登录），直接轮询。"""
     if os.environ.get("MAILBOX_BROKER"):
         return await fetch_from_broker(email, password, sender_hint, subject_hint, code_regex, "code", max_wait)
-    if not await _outlook_login(page, email, password):
-        return None
     pat = re.compile(code_regex)
-    # 进收件箱让整个邮箱界面完整加载一次
-    try:
-        await page.goto("https://outlook.live.com/mail/0/", timeout=60000)
-        await asyncio.sleep(6)
-    except Exception:
-        pass
+    if not skip_login:
+        if not await _outlook_login(page, email, password):
+            return None
+        # 进收件箱让整个邮箱界面完整加载一次
+        try:
+            await page.goto("https://outlook.live.com/mail/0/", timeout=60000)
+            await asyncio.sleep(6)
+        except Exception:
+            pass
+        await _dismiss_inbox_popup(page)   # 关掉通知权限/引导弹窗
 
     INBOX_NAMES = ["收件箱", "Inbox", "受信トレイ"]
     JUNK_NAMES = ["垃圾邮件", "Junk Email", "Junk", "迷惑メール"]
