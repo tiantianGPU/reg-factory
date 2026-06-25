@@ -874,8 +874,32 @@ async def click_finish_button(page, index, age_sel, max_wait=12):
                 try:
                     await btn.click(timeout=6000)
                     print("  [onboarding] clicked Finish button")
-                    await asyncio.sleep(3)
-                    return True
+                    # 关键：点了不等于提交成功。about-you 表单常出现"按钮可点但 submit 被
+                    # 服务端拒/未导航"——必须验证是否真离开 about-you 页；没走就升级提交手段
+                    # (age 框回车 + form.requestSubmit)，否则上层会误判成功、再 re-fill 把按钮搞回 disabled。
+                    for _ in range(4):
+                        await asyncio.sleep(1.5)
+                        if "about-you" not in page.url.lower():
+                            return True
+                    print("  [onboarding] 点了 Finish 但仍在 about-you，升级提交(Enter + requestSubmit)...")
+                    try:
+                        ae = page.locator(age_sel).first
+                        if await ae.count() > 0:
+                            await ae.press("Enter", timeout=2000)
+                    except Exception:
+                        pass
+                    try:
+                        await btn.evaluate("(b) => { const f = b.closest('form'); if (f) f.requestSubmit ? f.requestSubmit(b) : f.submit(); }")
+                    except Exception:
+                        pass
+                    for _ in range(4):
+                        await asyncio.sleep(1.5)
+                        if "about-you" not in page.url.lower():
+                            return True
+                    # 仍没走：返回 False，让上层别再 re-fill(会重置 React 态、按钮重新 disabled)，
+                    # 而是下一轮检测到还在 about-you 时只重试点击。
+                    print("  [onboarding] 升级提交后仍在 about-you")
+                    return False
                 except Exception as e:
                     print(f"  [onboarding] Finish click failed: {str(e)[:60]}")
         await asyncio.sleep(1)
@@ -937,6 +961,7 @@ async def dump_onboarding_fields(page, tag=""):
 async def handle_onboarding(page, index, max_rounds=6):
     """处理注册后的引导页：名字、生日/年龄、各种 Continue/Agree"""
     name_done = False  # about-you 名字只填一次，避免每轮重置成新随机名
+    age_done = False   # 年龄同理只填一次：re-fill 会重置 React 态、把已解禁的 Finish 按钮搞回 disabled
     bday_done = False
     for r in range(max_rounds):
         await asyncio.sleep(2)
@@ -951,6 +976,8 @@ async def handle_onboarding(page, index, max_rounds=6):
 
         # about-you 页（名字+年龄）：填一次 -> 失焦触发校验 -> 等按钮可用后点 Finish。
         # 这里独立处理，不走下面的泛化 Continue 匹配（会被 disabled 按钮卡住空转）。
+        # 名字/年龄都只填一次(name_done/age_done)：re-fill 会重置 React 态、把按钮搞回 disabled，
+        # 导致 round0 点了没走、round1 re-fill 后反而点不动的死循环(实测根因)。
         if on_about_you:
             if not name_done and await page.locator(name_sel).count() > 0:
                 first, last = rand_name()
@@ -960,11 +987,13 @@ async def handle_onboarding(page, index, max_rounds=6):
                     name_done = True
                     await blur_field(page, name_sel)
                     await asyncio.sleep(0.2)
-            if await react_fill(page, age_sel, str(random.randint(18, 40)), tries=2, delay=12, settle=0.15, verbose=False):
-                print("  [onboarding] age filled")
-                # 关键：失焦让 onBlur 校验跑起来，Finish 按钮才会解除 disabled
-                await blur_field(page, age_sel)
-                await asyncio.sleep(0.3)
+            if not age_done:
+                if await react_fill(page, age_sel, str(random.randint(18, 40)), tries=2, delay=12, settle=0.15, verbose=False):
+                    print("  [onboarding] age filled")
+                    age_done = True
+                    # 关键：失焦让 onBlur 校验跑起来，Finish 按钮才会解除 disabled
+                    await blur_field(page, age_sel)
+                    await asyncio.sleep(0.3)
             if await click_finish_button(page, index, age_sel):
                 await asyncio.sleep(3)
                 continue  # 进入下一轮看是否还有后续引导页
