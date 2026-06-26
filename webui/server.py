@@ -399,19 +399,20 @@ async def api_sms_rent(request: Request):
         data = {}
     service = (data or {}).get("service") or _gmail_service_default()
     country = str((data or {}).get("country") or "0")
+    prefer_multi = (data or {}).get("prefer_multi", True)
     if not _read_config_val("SMSMAN_TOKEN", ""):
         return {"ok": False, "msg": "未配置 SMSMAN_TOKEN，请到配置页填写"}
     try:
         from common import sms
-        res = await asyncio.to_thread(sms._smsman_get_phone, service, country, "", ())
+        res = await asyncio.to_thread(sms.smsman_rent, service, country, bool(prefer_multi), "", ())
     except Exception as e:
         return {"ok": False, "msg": f"租号异常: {str(e)[:120]}"}
     if not res:
         return {"ok": False, "msg": f"租号失败(服务 '{service}' 无货/余额不足/服务名错)。可在配置页测试 sms-man，或换服务名"}
-    phone, pkey = res
+    phone, pkey, can_multi = res
     rented_at = time.time()
-    SMS_RENTS[pkey] = {"phone": phone, "rented_at": rented_at, "codes": [], "service": service}
-    return {"ok": True, "phone": phone, "pkey": pkey, "service": service, "ttl": SMS_RENT_TTL}
+    SMS_RENTS[pkey] = {"phone": phone, "rented_at": rented_at, "codes": [], "service": service, "can_multi": can_multi}
+    return {"ok": True, "phone": phone, "pkey": pkey, "service": service, "can_multi": can_multi, "ttl": SMS_RENT_TTL}
 
 
 @app.post("/api/sms/code")
@@ -464,6 +465,7 @@ def api_sms_rents():
             SMS_RENTS.pop(pkey, None)  # 过期太久自动清理
             continue
         out.append({"pkey": pkey, "phone": rec["phone"], "service": rec.get("service"),
+                    "can_multi": rec.get("can_multi", False),
                     "codes": rec["codes"], "elapsed": int(elapsed),
                     "remain": max(0, int(SMS_RENT_TTL - elapsed))})
     return {"rents": out, "ttl": SMS_RENT_TTL}

@@ -273,6 +273,7 @@ async function refreshRents(){
       <div class="rent-phone">
         <b>+${r.phone}</b>
         <button class="mini" data-copy="${r.phone}">复制号码</button>
+        <span class="multi-badge ${r.can_multi?'ok':'no'}">${r.can_multi?'多次接码':'单次'}</span>
         <span class="remain" data-remain="${r.remain}">剩 ${fmtRemain(r.remain)}</span>
       </div>
       <div class="rent-actions">
@@ -301,7 +302,8 @@ async function refreshRents(){
 
 $('#btn-rent').onclick = async ()=>{
   const btn=$('#btn-rent'); const o=btn.textContent; btn.disabled=true; btn.textContent='租号中…';
-  const body={ service: $('#sms-service').value.trim()||undefined, country: $('#sms-country').value.trim()||undefined };
+  const body={ service: $('#sms-service').value.trim()||undefined, country: $('#sms-country').value.trim()||undefined,
+    prefer_multi: $('#sms-prefer-multi') ? $('#sms-prefer-multi').checked : true };
   try{
     const r = await (await fetch('/api/sms/rent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
     if(!r.ok){ alert('获取号码失败: '+r.msg); }

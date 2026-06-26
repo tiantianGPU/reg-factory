@@ -124,3 +124,10 @@ body{margin:0;background:var(--bg);color:var(--text);
   background:#0a0c10;border:1px solid var(--line);border-radius:8px;color:#c8d0da;
   font-family:var(--mono);font-size:13px;line-height:1.5;resize:vertical}
 #view-mailpool code{background:var(--panel2);padding:2px 6px;border-radius:4px;font-size:12.5px}
+
+/* ---- 接码多收标记 ---- */
+.multi-pref{display:block;margin-top:8px;font-size:12.5px;color:var(--dim);cursor:pointer}
+.multi-pref input{vertical-align:middle;margin-right:5px}
+.multi-badge{font-size:11px;padding:1px 7px;border-radius:4px;margin-left:4px}
+.multi-badge.ok{background:rgba(63,191,107,.18);color:var(--green);border:1px solid var(--green)}
+.multi-badge.no{background:rgba(154,163,178,.15);color:var(--dim);border:1px solid var(--line)}

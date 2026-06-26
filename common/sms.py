@@ -300,6 +300,54 @@ def _smsman_rank_countries(app_id, max_price="", blacklist=()):
     return cids
 
 
+def smsman_rent(app, country_id="0", prefer_multi=True, max_price="", blacklist=()):
+    """接码助手专用租号：返回 (number, pkey, can_multi) 或 None。
+    prefer_multi=True 时优先租 can_receive_multiple_sms=True 的号(适合 Gmail 多次验证)：
+    先试已知支持多收的国家(马来6等)，没有再退而求其次拿普通号。
+    country_id 指定具体国家时直接租该国(忽略 prefer)。"""
+    app_id = _smsman_resolve_app(app)
+    if not app_id:
+        return None
+
+    def _try(cid):
+        params = {"token": SMSMAN_TOKEN, "country_id": str(cid), "application_id": str(app_id)}
+        if str(max_price).strip() not in ("", "0"):
+            params["maxPrice"] = str(max_price).strip(); params["currency"] = "USD"
+        try:
+            data = _smsman_get("get-number", params, timeout=30)
+        except Exception as e:
+            print(f"  [sms-man] get-number(country={cid}) 失败: {e}")
+            return None
+        if isinstance(data, dict) and data.get("request_id") and data.get("number"):
+            multi = bool(data.get("can_receive_multiple_sms"))
+            print(f"  [sms-man] phone: +{data['number']} (req={data['request_id']}, country={data.get('country_id')}, 多收={multi})")
+            return str(data["number"]), f"smsman_{data['request_id']}", multi
+        return None
+
+    cid = str(country_id or "0").strip()
+    if cid not in ("", "0"):
+        return _try(cid)
+
+    bl = {str(b) for b in blacklist}
+    # 已知支持多收的国家优先(马来6/印度22/越南117实测/经验)，再常备国家兜底
+    multi_first = [c for c in ("6", "22", "117", "16") if c not in bl]
+    others = [c for c in ("7", "36", "4", "12", "14", "10") if c not in bl and c not in multi_first]
+    order = (multi_first + others) if prefer_multi else (["7", "6", "16", "22", "117", "36", "4", "12"])
+    fallback = None  # 拿到的非多收号(实在没多收号时用)
+    for c in order:
+        res = _try(c)
+        if not res:
+            continue
+        if not prefer_multi or res[2]:
+            return res  # 命中(多收号 或 不要求多收)
+        # 是普通号：先记着，继续找多收号；找不到再用它
+        if fallback is None:
+            fallback = res
+        else:
+            _smsman_release(res[1])  # 多余的普通号退掉不浪费
+    return fallback
+
+
 def _smsman_request_number(app_id, country_id, max_price=""):
     """单次 GET /get-number。
     返回：成功 -> (full_phone, 'smsman_<request_id>')；该国无货 -> None；
