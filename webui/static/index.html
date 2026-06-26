@@ -21,6 +21,7 @@
   <nav class="sidebar">
     <div class="nav-section">
       <button class="navbtn active" data-view="run">▶ 运行任务</button>
+      <button class="navbtn" data-view="mailpool">📥 邮箱池</button>
       <button class="navbtn" data-view="env">⚙️ 配置 (.env)</button>
     </div>
     <div id="script-nav"></div>
@@ -63,6 +64,25 @@
           <button id="btn-rent" class="btn-run">获取号码</button>
           <div id="sms-rents"></div>
         </aside>
+      </div>
+    </section>
+
+    <!-- 邮箱池视图 -->
+    <section id="view-mailpool" style="display:none">
+      <div class="panel">
+        <div class="env-head">
+          <h2>📥 批量导入邮箱池</h2>
+          <span id="mailpool-total" class="env-msg"></span>
+        </div>
+        <p class="hint">外部邮箱直接入池，三平台注册可直接用，无需自己注册。每行一个，至少 <b>邮箱+密码</b>。<br>
+          格式：<code>邮箱@outlook.com----密码----refresh_token----client_id</code>
+          （token/client_id 可省；分隔符兼容多横线 / 逗号 / 制表符 / 竖线）。已在池中的邮箱自动跳过。</p>
+        <textarea id="mailpool-input" class="mailpool-input" spellcheck="false"
+          placeholder="aaa@outlook.com----Pass123----M.C5xx...----9e5f94bc-...&#10;bbb@outlook.com----Pass456"></textarea>
+        <div>
+          <button id="btn-import-mail" class="btn-run">导入到邮箱池</button>
+          <span id="mailpool-msg" class="env-msg"></span>
+        </div>
       </div>
     </section>
 

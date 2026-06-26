@@ -118,3 +118,9 @@ body{margin:0;background:var(--bg);color:var(--text);
   padding:5px 10px;border-radius:6px;border:1px solid var(--line)}
 .dim{color:var(--dim);font-size:12.5px}
 .sms-msg{color:var(--dim);font-size:12px;margin-top:8px;min-height:14px}
+
+/* ---- 邮箱池批量导入 ---- */
+.mailpool-input{width:100%;min-height:240px;margin:12px 0;padding:12px;
+  background:#0a0c10;border:1px solid var(--line);border-radius:8px;color:#c8d0da;
+  font-family:var(--mono);font-size:13px;line-height:1.5;resize:vertical}
+#view-mailpool code{background:var(--panel2);padding:2px 6px;border-radius:4px;font-size:12.5px}

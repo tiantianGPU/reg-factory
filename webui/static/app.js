@@ -26,8 +26,10 @@ function showView(v){
   $('#view-run').style.display  = v==='run' ? 'flex' : 'none';
   $('#view-env').style.display  = v==='env' ? 'block' : 'none';
   $('#view-embed').style.display = v==='embed' ? 'block' : 'none';
+  $('#view-mailpool').style.display = v==='mailpool' ? 'block' : 'none';
   $$('.navbtn').forEach(b=>b.classList.toggle('active', b.dataset.view===v));
   if(v==='env') loadEnv();
+  if(v==='mailpool') loadMailpool();
 }
 $$('.navbtn').forEach(b=> b.onclick = ()=> showView(b.dataset.view));
 
@@ -322,6 +324,35 @@ async function releaseNum(pkey){
   await fetch('/api/sms/release',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pkey})});
   await refreshRents();
 }
+
+// ---------------------------------------------------------------- 邮箱池
+async function loadMailpool(){
+  try{
+    const d = await (await fetch('/api/mailpool')).json();
+    $('#mailpool-total').textContent = `当前池中 ${d.total} 个邮箱`;
+  }catch(e){}
+}
+
+$('#btn-import-mail').onclick = async ()=>{
+  const text = $('#mailpool-input').value;
+  if(!text.trim()){ $('#mailpool-msg').textContent='请先粘贴邮箱'; return; }
+  const btn=$('#btn-import-mail'); const o=btn.textContent; btn.disabled=true; btn.textContent='导入中…';
+  const msg=$('#mailpool-msg'); msg.textContent='';
+  try{
+    const r = await (await fetch('/api/mailpool',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text})})).json();
+    if(r.ok){
+      let m = `✓ 导入 ${r.added}，跳过重复 ${r.skipped}`;
+      if(r.bad) m += `，格式错误 ${r.bad}`;
+      m += `，池中共 ${r.total}`;
+      msg.textContent = m;
+      if(r.bad && r.bad_samples.length) msg.textContent += `（错误样例：${r.bad_samples[0]}…）`;
+      $('#mailpool-total').textContent = `当前池中 ${r.total} 个邮箱`;
+      if(r.added) $('#mailpool-input').value='';
+    }else{ msg.textContent='导入失败: '+(r.msg||''); }
+  }catch(e){ msg.textContent='导入请求失败: '+e; }
+  finally{ btn.disabled=false; btn.textContent=o; }
+};
 
 // ---------------------------------------------------------------- 启动
 loadScripts();

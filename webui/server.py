@@ -293,6 +293,99 @@ def api_embeds():
     return {"embeds": getattr(schema, "EMBED_PAGES", [])}
 
 
+# ============================================================ 邮箱池批量导入
+EMAILS_FILE = os.path.join(ROOT, "emails.txt")
+import re as _re
+_EMAIL_RE = _re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+def _parse_mail_line(line):
+    """把一行拆成 [email, password, token, client_id]。兼容分隔符：----(多横线)/制表符/逗号/竖线/空格。
+    email+密码必填，否则返回 None。"""
+    s = line.strip()
+    if not s or s.startswith("#"):
+        return None
+    # 统一各种分隔符成 \x00：先处理 2+ 连字符，再 tab/逗号/竖线
+    norm = _re.sub(r"-{2,}", "\x00", s)
+    norm = _re.sub(r"[\t,|]+", "\x00", norm)
+    parts = [p.strip() for p in norm.split("\x00")]
+    # 若没拆出多列(只有空格分隔)，退化用空白拆
+    if len(parts) < 2:
+        parts = [p.strip() for p in s.split() if p.strip()]
+    parts = [p for p in parts if p != ""]
+    if len(parts) < 2:
+        return None
+    email, password = parts[0], parts[1]
+    if not _EMAIL_RE.match(email):
+        return None
+    token = parts[2] if len(parts) >= 3 else ""
+    client_id = parts[3] if len(parts) >= 4 else ""
+    # 去掉尾部空字段，避免写出 "email----pass--------"(多余空列)
+    fields = [email, password, token, client_id]
+    while len(fields) > 2 and fields[-1] == "":
+        fields.pop()
+    return fields
+
+
+def _existing_emails():
+    emails = set()
+    if os.path.isfile(EMAILS_FILE):
+        for line in open(EMAILS_FILE, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                emails.add(line.split("----")[0].strip().lower())
+    return emails
+
+
+@app.get("/api/mailpool")
+def api_mailpool_get():
+    total = 0
+    if os.path.isfile(EMAILS_FILE):
+        for line in open(EMAILS_FILE, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                total += 1
+    return {"total": total}
+
+
+@app.post("/api/mailpool")
+async def api_mailpool_import(request: Request):
+    data = await request.json()
+    text = (data or {}).get("text") or ""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    existing = _existing_emails()
+    added, skipped, bad = 0, 0, 0
+    bad_samples = []
+    seen = set(existing)
+    out_lines = []
+    for ln in lines:
+        if not ln.strip():
+            continue
+        parsed = _parse_mail_line(ln)
+        if not parsed:
+            bad += 1
+            if len(bad_samples) < 5:
+                bad_samples.append(ln.strip()[:60])
+            continue
+        email = parsed[0].lower()
+        if email in seen:
+            skipped += 1
+            continue
+        seen.add(email)
+        out_lines.append("----".join(parsed))
+        added += 1
+    if out_lines:
+        # 追加(确保前面有换行)
+        need_nl = os.path.isfile(EMAILS_FILE) and os.path.getsize(EMAILS_FILE) > 0
+        with open(EMAILS_FILE, "a", encoding="utf-8") as f:
+            if need_nl:
+                f.write("\n")
+            f.write("\n".join(out_lines) + "\n")
+    total = len(_existing_emails())
+    return {"ok": True, "added": added, "skipped": skipped, "bad": bad,
+            "bad_samples": bad_samples, "total": total}
+
+
 # ============================================================ sms-man 接码助手
 def _gmail_service_default():
     return _read_config_val("SMSMAN_APP_ID_GMAIL", "") or "google"
