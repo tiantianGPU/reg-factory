@@ -49,7 +49,7 @@ setInterval(pollStatus, 5000);
 function showView(v){
   setNavOpen(false);
   document.body.classList.toggle('k12-active', v==='k12');
-  $('#view-run').style.display  = v==='run' ? 'flex' : 'none';
+  $('#view-run').style.display  = v==='run' ? '' : 'none';
   $('#view-env').style.display  = v==='env' ? 'block' : 'none';
   $('#view-embed').style.display = v==='embed' ? 'block' : 'none';
   $('#view-mailpool').style.display = v==='mailpool' ? 'block' : 'none';
@@ -165,6 +165,7 @@ async function loadScripts(){
 function selectScript(id){
   curSrc = SCRIPTS.find(s=>s.id===id);
   $$('.scriptbtn').forEach(b=>b.classList.toggle('active', b.dataset.id===id));
+  if(!evtSrc) setRunState('idle', '待运行');
   renderForm(curSrc);
 }
 
@@ -227,25 +228,62 @@ function collectArgs(s){
 }
 
 // ---------------------------------------------------------------- 运行 + SSE 日志
+function setRunState(state, label){
+  const el = $('#run-state');
+  el.className = `run-state ${state}`;
+  el.textContent = label;
+}
+
 async function runScript(){
-  if(curRun && evtSrc){ evtSrc.close(); }
+  if(curRun && evtSrc){ evtSrc.close(); evtSrc = null; }
   const args = collectArgs(curSrc);
   const log = $('#log'); log.textContent='';
   $('#log-title').textContent = `运行日志 — ${curSrc.title}`;
-  const r = await (await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({script:curSrc.id, args})})).json();
-  if(r.error){ log.textContent='错误: '+r.error; return; }
+  setRunState('running', '运行中');
+  let r;
+  try{
+    r = await (await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({script:curSrc.id, args})})).json();
+  }catch(e){
+    log.textContent='启动失败: '+e;
+    setRunState('failed', '启动失败');
+    return;
+  }
+  if(r.error){
+    log.textContent='错误: '+r.error;
+    setRunState('failed', '启动失败');
+    return;
+  }
   curRun = r.run_id;
   $('#cmd-preview').textContent = '$ '+r.cmd;
   $('#btn-stop').disabled = false;
-  evtSrc = new EventSource(`/api/logs/${curRun}`);
-  evtSrc.onmessage = e=>{ log.textContent += e.data+'\n'; log.scrollTop = log.scrollHeight; };
-  evtSrc.addEventListener('done', ()=>{ evtSrc.close(); $('#btn-stop').disabled = true; pollStatus(); });
-  evtSrc.onerror = ()=>{ evtSrc.close(); $('#btn-stop').disabled = true; };
+  const stream = new EventSource(`/api/logs/${curRun}`);
+  evtSrc = stream;
+  stream.onmessage = e=>{ log.textContent += e.data+'\n'; log.scrollTop = log.scrollHeight; };
+  stream.addEventListener('done', e=>{
+    let result = {};
+    try{ result = JSON.parse(e.data); }catch(err){}
+    if(result.stopped) setRunState('stopped', '已停止');
+    else if(result.returncode===0) setRunState('success', '已成功');
+    else setRunState('failed', `失败 (${result.returncode ?? '?'})`);
+    stream.close();
+    if(evtSrc === stream){ evtSrc = null; curRun = null; }
+    $('#btn-stop').disabled = true;
+    pollStatus();
+  });
+  stream.onerror = ()=>{
+    stream.close();
+    if(evtSrc !== stream) return;
+    evtSrc = null;
+    curRun = null;
+    $('#btn-stop').disabled = true;
+    if($('#run-state').classList.contains('running')) setRunState('failed', '日志连接中断');
+  };
 }
 
 $('#btn-stop').onclick = async ()=>{
   if(!curRun) return;
+  setRunState('stopped', '停止中');
   await fetch(`/api/stop/${curRun}`,{method:'POST'});
   $('#btn-stop').disabled = true;
 };

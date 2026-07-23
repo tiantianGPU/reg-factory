@@ -74,11 +74,25 @@ body{margin:0;background:var(--bg);color:var(--text);
 .btn-stop:disabled{opacity:.4;cursor:not-allowed}
 
 .log-panel{flex:1;display:flex;flex-direction:column;min-height:200px}
-.log-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.log-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:8px}
+.log-heading{display:flex;align-items:center;gap:10px;min-width:0}
+.run-state{display:inline-flex;align-items:center;justify-content:center;min-width:58px;min-height:22px;
+  padding:2px 8px;border:1px solid var(--line);border-radius:4px;color:var(--dim);
+  background:var(--panel2);font-size:11px;white-space:nowrap}
+.run-state.running{border-color:var(--accent);color:var(--accent)}
+.run-state.success{border-color:var(--green);color:var(--green)}
+.run-state.failed{border-color:var(--red);color:var(--red)}
+.run-state.stopped{border-color:var(--dim);color:var(--dim)}
 .log{flex:1;background:#0a0c10;border:1px solid var(--line);border-radius:8px;padding:12px;
   overflow-y:auto;font-family:var(--mono);font-size:12.5px;line-height:1.55;white-space:pre-wrap;
   margin:0;color:#c8d0da;min-height:160px}
 .cmd-line{color:var(--dim);font-family:var(--mono);font-size:12px;margin:6px 0 0;word-break:break-all}
+
+@media (min-width:1101px){
+  #view-run{display:grid;grid-template-columns:minmax(380px,540px) minmax(0,1fr);align-items:stretch}
+  #form-panel{min-height:0;overflow-y:auto}
+  .log-panel{min-height:0}
+}
 
 .env-head{display:flex;align-items:center;gap:14px}
 .env-head h2{margin:0;font-size:18px;flex:0 0 auto}
@@ -227,6 +241,7 @@ body{margin:0;background:var(--bg);color:var(--text);
   .env-group-title{align-items:flex-start}
   .test-area{width:100%;flex-wrap:wrap}
   .log-panel{min-height:280px}
+  .log-heading{gap:7px}
   .log{font-size:11.5px;padding:9px}
   .mailpool-input{min-height:190px}
   .contact-dialog{padding:10px}

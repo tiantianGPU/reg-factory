@@ -12,6 +12,7 @@ VISION_API_BASE/VISION_API_KEY/VISION_MODEL、VOTE_ZZ_*/VOTE_GPT_*/VOTE_OPUS_*�
 import os
 import re
 import sys
+import time
 
 import requests
 
@@ -151,40 +152,78 @@ def _ask_one(base, key, model, prompt, image_b64, max_tokens=900):
     if not base or not key:
         return None
     mtype = "image/jpeg" if image_b64.startswith("/9j/") else "image/png"
-    try:
-        is_anthropic = base.rstrip("/").endswith("/claude") or "/v1/messages" in base
-        if is_anthropic:
-            ep = base.rstrip("/")
-            if not ep.endswith("/v1/messages"):
-                ep = ep + "/v1/messages"
-            r = requests.post(
-                ep,
-                headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={"model": model, "max_tokens": max_tokens, "messages": [{"role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image", "source": {"type": "base64", "media_type": mtype, "data": image_b64}}]}]},
+    for attempt in range(1, 4):
+        try:
+            is_anthropic = base.rstrip("/").endswith("/claude") or "/v1/messages" in base
+            if is_anthropic:
+                ep = base.rstrip("/")
+                if not ep.endswith("/v1/messages"):
+                    ep = ep + "/v1/messages"
+                r = requests.post(
+                    ep,
+                    headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json={"model": model, "max_tokens": max_tokens, "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image", "source": {"type": "base64", "media_type": mtype, "data": image_b64}}]}]},
+                    timeout=20,
+                )
+                if r.status_code == 200:
+                    txt = "".join(b.get("text", "") for b in r.json().get("content", []))
+                    if txt and not looks_like_refusal(txt):
+                        return txt
+                if r.status_code not in (408, 429, 500, 502, 503, 504):
+                    return None
+            else:
+                r = requests.post(
+                    f"{base.rstrip('/')}/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    json={"model": model, "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:{mtype};base64,{image_b64}"}}]}],
+                          "max_tokens": max_tokens, "temperature": 0.0},
+                    timeout=20,
+                )
+                if r.status_code == 200:
+                    txt = r.json()["choices"][0]["message"]["content"]
+                    if not looks_like_refusal(txt):
+                        return txt
+                if r.status_code not in (408, 429, 500, 502, 503, 504):
+                    return None
+        except Exception as e:
+            print(f"  [vote] {model} attempt {attempt}/3 err: {str(e)[:50]}")
+        if attempt < 3:
+            time.sleep(attempt)
+    if not is_anthropic:
+        try:
+            from curl_cffi import requests as curl_requests
+
+            r = curl_requests.post(
+                f"{base.rstrip('/')}/v1/chat/completions",
+                impersonate="chrome131",
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:{mtype};base64,{image_b64}"
+                        }},
+                    ]}],
+                    "max_tokens": max_tokens,
+                    "temperature": 0.0,
+                },
                 timeout=35,
             )
             if r.status_code == 200:
-                txt = "".join(b.get("text", "") for b in r.json().get("content", []))
-                if txt and not looks_like_refusal(txt):
+                txt = r.json()["choices"][0]["message"]["content"]
+                if not looks_like_refusal(txt):
+                    print(f"  [vote] {model} recovered through Chrome TLS")
                     return txt
-            return None
-        r = requests.post(
-            f"{base.rstrip('/')}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={"model": model, "messages": [{"role": "user", "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:{mtype};base64,{image_b64}"}}]}],
-                  "max_tokens": max_tokens, "temperature": 0.0},
-            timeout=35,
-        )
-        if r.status_code == 200:
-            txt = r.json()["choices"][0]["message"]["content"]
-            if not looks_like_refusal(txt):
-                return txt
-    except Exception as e:
-        print(f"  [vote] {model} err: {str(e)[:50]}")
+        except Exception as e:
+            print(f"  [vote] {model} Chrome TLS fallback err: {str(e)[:50]}")
     return None
 
 
@@ -204,9 +243,36 @@ def _parse_picklist(txt, n_options):
     """从回复抠 PICK=[i,j,...]（多选网格）。返回去重排序后的合法索引列表，或 None。"""
     if not txt:
         return None
-    m = re.findall(r"PICK\s*=\s*\[([0-9,\s]*)\]", txt)
+    m = re.findall(
+        r"\bPICK\b\s*[:=]\s*\[([0-9,\s]*)\]",
+        txt,
+        flags=re.IGNORECASE,
+    )
     if not m:
-        return None
+        answer = re.findall(
+            r"\bANSWER\b\s*[:=]\s*(\d+)", txt, flags=re.IGNORECASE
+        )
+        if answer:
+            value = int(answer[-1])
+            return [value] if 0 <= value < n_options else None
+        tail = txt[-320:]
+        if not re.search(
+            r"\b(?:click|select|pick|answer|cell|cells|tile|tiles)\b",
+            tail,
+            flags=re.IGNORECASE,
+        ):
+            return None
+        explicit_cells = re.findall(r"#\s*(\d+)", tail)
+        if not explicit_cells:
+            explicit_cells = re.findall(
+                r"\b(?:cell|tile)\s*(\d+)\b", tail, flags=re.IGNORECASE
+            )
+        idxs = []
+        for part in explicit_cells:
+            value = int(part)
+            if 0 <= value < n_options and value not in idxs:
+                idxs.append(value)
+        return sorted(idxs) if idxs else None
     raw = m[-1]
     idxs = []
     for part in raw.split(","):
@@ -338,8 +404,9 @@ def vote_picklist(prompt, image_b64, n_options, max_tokens=900, deadline=55, min
     n_voters = 0
     if not VOTER_MODELS:
         txt = ask_vision(prompt, image_b64, max_tokens=max_tokens)
-        picks = _parse_picklist(txt, n_options) or []
-        return picks, {i: 1 for i in picks}, [("primary", picks, (txt or "")[-160:])]
+        parsed = _parse_picklist(txt, n_options)
+        picks = parsed or []
+        return picks, {i: 1 for i in picks}, [("primary", parsed, (txt or "")[-160:])]
     done = set()
     with cf.ThreadPoolExecutor(max_workers=len(VOTER_MODELS)) as ex:
         futs = {ex.submit(_ask_one, b, k, m, prompt, image_b64, max_tokens): m

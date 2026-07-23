@@ -38,8 +38,10 @@ except Exception:
     CHATGPT2API_URL, CHATGPT2API_KEY = "", ""
 
 try:
-    from config import (SUB2API_URL, SUB2API_EMAIL, SUB2API_PASSWORD, SUB2API_GROUP,
-                        CPA_URL, CPA_MGMT_KEY)
+    from config import (
+        SUB2API_URL, SUB2API_EMAIL, SUB2API_PASSWORD, SUB2API_GROUP,
+        CPA_URL, CPA_MGMT_KEY,
+    )
 except Exception:
     SUB2API_URL = SUB2API_EMAIL = SUB2API_PASSWORD = ""
     SUB2API_GROUP = "codex"
@@ -74,13 +76,94 @@ def _env_int(name, default):
         return int(default)
 
 
-# CF 友好节点池：ChatGPT 注册页对宿主出口 IP 敏感，AWS 机房 + 部分中转 IP(如 216.195.209.x)
-# 会被 Cloudflare 全页 Turnstile 拦(body 空)。这些 188.253.x 的 NF 节点实测能静默放行。
-# 可经环境变量 CHATGPT_CF_NODES 覆盖(逗号分隔精确节点名)。检测到 CF 拦截就轮换到下一个。
-_DEFAULT_CF_NODES = ["level1-日本01-NF", "level1-日本02-NF", "level1-新加坡01-NF",
-                     "level1-新加坡02-NF", "level1-韩国01", "level1-法国01"]
-CF_NODES = [n.strip() for n in (_os.environ.get("CHATGPT_CF_NODES") or "").split(",") if n.strip()] or _DEFAULT_CF_NODES
+# CF 友好节点池。显式配置时按给定顺序使用；auto 默认从 Clash 当前代理组
+# 动态读取，避免订阅更新/节点改名后继续尝试已经不存在的历史名称。
+CF_NODES = [
+    node.strip()
+    for node in (_os.environ.get("CHATGPT_CF_NODES") or "").split(",")
+    if node.strip()
+]
+_active_cf_nodes = []
 _cf_node_idx = [0]  # 轮换游标
+
+
+def _order_chatgpt_nodes(candidates):
+    """Interleave preferred regions so a small probe budget covers varied exits."""
+    region_markers = (
+        ("🇯🇵", "日本", "Japan"),
+        ("🇸🇬", "新加坡", "Singapore"),
+        ("🇰🇷", "韩国", "Korea"),
+        ("🇫🇷", "法国", "France"),
+        ("🇺🇸", "美国", "United States", "USA"),
+        ("🇬🇧", "英国", "United Kingdom"),
+        ("🇩🇪", "德国", "Germany"),
+        ("🇨🇦", "加拿大", "Canada"),
+        ("🇦🇺", "澳大利亚", "Australia"),
+        ("🇹🇼", "台湾", "Taiwan"),
+    )
+    buckets = [[] for _ in region_markers]
+    remaining = []
+    for node in candidates:
+        bucket = next(
+            (
+                index
+                for index, markers in enumerate(region_markers)
+                if any(marker.lower() in node.lower() for marker in markers)
+            ),
+            None,
+        )
+        if bucket is None:
+            remaining.append(node)
+        else:
+            buckets[bucket].append(node)
+
+    ordered = []
+    while any(buckets):
+        for bucket in buckets:
+            if bucket:
+                ordered.append(bucket.pop(0))
+    return ordered + remaining
+
+
+def _discover_chatgpt_nodes():
+    """Return real leaf proxies from the configured Clash selector group."""
+    import _clash_verge as cv
+
+    api = _os.environ.get("CLASH_API", "http://127.0.0.1:9097")
+    secret = _os.environ.get("CLASH_SECRET", "")
+    group = _os.environ.get("CLASH_GROUP", "GLOBAL") or "GLOBAL"
+    client = cv.ClashClient(api, secret)
+    catalog = (client.proxies().get("proxies") or {})
+    group_info = catalog.get(group)
+    if not group_info:
+        group_info = client.group(group)
+
+    group_types = {"selector", "urltest", "fallback", "loadbalance"}
+    candidates = []
+    for name in group_info.get("all") or []:
+        info = catalog.get(name) or {}
+        if name in cv.SPECIAL_NAMES or cv.is_fake_node(name):
+            continue
+        if (info.get("type") or "").lower() in group_types:
+            continue
+        candidates.append(name)
+
+    if not candidates:
+        raise RuntimeError(f"Clash 代理组 {group!r} 中没有可用的叶子节点")
+    return _order_chatgpt_nodes(candidates)
+
+
+def _chatgpt_node_candidates():
+    """Resolve and cache the candidate pool shared by preflight and CF rotation."""
+    global _active_cf_nodes
+    if _active_cf_nodes:
+        return list(_active_cf_nodes)
+
+    candidates = list(CF_NODES) if CF_NODES else _discover_chatgpt_nodes()
+    limit = max(1, _env_int("CHATGPT_NODE_PROBE_LIMIT", 12))
+    _active_cf_nodes = candidates[:limit]
+    _cf_node_idx[0] = 0
+    return list(_active_cf_nodes)
 
 
 async def _is_cf_blocked(page):
@@ -142,8 +225,9 @@ def _activate_cf_node(node):
 
 
 def _switch_cf_node():
-    """把 Clash GLOBAL 切到下一个 CF 友好节点。"""
-    node = CF_NODES[_cf_node_idx[0] % len(CF_NODES)]
+    """把 Clash 代理组切到候选池中的下一个节点。"""
+    candidates = _chatgpt_node_candidates()
+    node = candidates[_cf_node_idx[0] % len(candidates)]
     _cf_node_idx[0] += 1
     return _activate_cf_node(node)
 
@@ -201,10 +285,14 @@ def select_chatgpt_node(requested, allow_blocked=False):
         print("  [node] ChatGPT 使用直连模式")
         return None
 
-    candidates = CF_NODES if value.lower() == "auto" else [value]
+    if value.lower() == "auto":
+        candidates = _chatgpt_node_candidates()
+        print(f"  [node] ChatGPT auto 从 Clash 读取 {len(candidates)} 个候选节点")
+    else:
+        candidates = [value]
     last_error = ""
     activated = []
-    for node in candidates:
+    for index, node in enumerate(candidates):
         if not _activate_cf_node(node):
             continue
         activated.append(node)
@@ -213,6 +301,7 @@ def select_chatgpt_node(requested, allow_blocked=False):
             ok, loc, status = _probe_chatgpt_node()
             print(f"  [node] ChatGPT probe {node}: HTTP {status} loc={loc} {'PASS' if ok else 'BLOCK'}")
             if ok:
+                _cf_node_idx[0] = index + 1
                 return node
         except Exception as e:
             last_error = str(e)
@@ -403,11 +492,12 @@ async def click_any_exact(page, labels):
     return False
 
 
-# cookie 同意横幅按钮（中/英/日），弹出时不关会挡住邮箱输入
+# cookie 同意横幅按钮（中/英/日/德），弹出时不关会挡住邮箱输入
 _COOKIE_BTNS = [
     "すべて受け入れる", "必須項目以外を拒否する",          # 日
     "Accept all", "Reject all", "Reject non-essential", "Accept", "Got it",  # 英
     "全部接受", "接受所有", "拒绝所有", "拒绝非必要", "同意", "知道了",          # 中
+    "Alle akzeptieren", "Annehmen",                       # 德
 ]
 
 
@@ -479,6 +569,24 @@ async def fill_email_verified(page, email_input, email, tries=4):
         print(f"  [2] email not committed, retry {i+1}/{tries}")
         await asyncio.sleep(1)
     return False
+
+
+async def chatgpt_email_submission_advanced(page):
+    """Return false while the visible email form still owns the auth flow."""
+    try:
+        email_input = page.locator(
+            'input[type="email"], input[name="email"]'
+        ).first
+        if await email_input.count() > 0 and await email_input.is_visible():
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def should_use_browser_mail_fallback(has_graph_token, code_try, total_tries=3):
+    """Use the slower Outlook UI only after the final Graph attempt fails."""
+    return bool(has_graph_token and code_try >= total_tries - 1)
 
 
 async def detect_challenge(page):
@@ -697,9 +805,10 @@ async def register_one(index, total, p):
             else:
                 # 点不动/死锁 -> 轮换 CF 友好节点重载，每个节点再试点一次
                 passed = False
-                for cf_try in range(len(CF_NODES)):
+                cf_candidates = _chatgpt_node_candidates()
+                for cf_try in range(len(cf_candidates)):
                     node = _switch_cf_node()
-                    print(f"  [cf] 点击未过，切节点 -> {node or '失败'} 重载({cf_try+1}/{len(CF_NODES)})...")
+                    print(f"  [cf] 点击未过，切节点 -> {node or '失败'} 重载({cf_try+1}/{len(cf_candidates)})...")
                     if not node:
                         break
                     await asyncio.sleep(3)
@@ -799,6 +908,33 @@ async def register_one(index, total, p):
             await asyncio.sleep(5)
             await dump_state(page, "after-email-retry")
 
+        # 部分登录页无错误提示，只把 ?email= 写进 URL 并留在原邮箱表单。
+        # 这种状态不能进入 onboarding，否则会反复点击同一个 Continue 后误到游客首页。
+        for submit_retry in range(2):
+            if await chatgpt_email_submission_advanced(page):
+                break
+            print(f"  [2] email form did not advance, retrying submit {submit_retry + 1}/2...")
+            await dismiss_cookie_banner(page)
+            email_input = page.locator(
+                'input[type="email"], input[name="email"]'
+            ).first
+            await fill_email_verified(page, email_input, email, tries=2)
+            if not await click_any_exact(
+                page,
+                ["Continue", "続行", "继续", "繼續", "Next", "下一步", "Teruskan", "Weiter"],
+            ):
+                sub = page.locator('button[type="submit"]')
+                if await sub.count() > 0:
+                    await sub.first.click()
+                else:
+                    await email_input.press("Enter")
+            await asyncio.sleep(5)
+            await dump_state(page, f"after-email-stuck-retry-{submit_retry + 1}")
+        if not await chatgpt_email_submission_advanced(page):
+            print("  [2][FAIL] email form remained on login after retries")
+            email_pool.mark_error(PLATFORM, email, email_pw, "email_submit_stuck")
+            return None
+
         # Step 3: 可能出现密码页 / 验证码页 / challenge
         # 先检测 challenge
         if await detect_challenge(page):
@@ -827,11 +963,12 @@ async def register_one(index, total, p):
 
         # Step 4: 邮件验证码
         # ChatGPT 通常发 6 位验证码或确认链接
+        verification_code_failed = False
         code_input = page.locator('input[inputmode="numeric"], input[name="code"], input[autocomplete="one-time-code"], input[type="text"]')
         if await code_input.count() > 0 or "verify" in page.url.lower() or "check" in (await page.locator("body").inner_text()).lower():
             code_sel = 'input[inputmode="numeric"], input[name="code"], input[autocomplete="one-time-code"], input[type="text"]'
 
-            async def _fetch_email_code(received_after=None):
+            async def _fetch_email_code(received_after=None, allow_browser_fallback=False):
                 """取一次码：先 Graph token，失败再浏览器登录 Outlook 取信。
                 取码窗口**跨 resend 复用**：已登录就只刷新收件箱轮询(skip_login)，不关窗不重登。
                 窗口统一在 Step 4 结束后的兜底处一次性 teardown。
@@ -845,8 +982,8 @@ async def register_one(index, total, p):
                         OAI_SENDER, OAI_SUBJECT, r"\b(\d{6})\b", 40, 5,
                         received_after=received_after)
                 )
-                if c or has_token:
-                    return c  # 有 token：拿到就返回；没拿到也直接回(交给上层 resend)，不开浏览器
+                if c or (has_token and not allow_browser_fallback):
+                    return c
                 if not c and email_pw:
                     # 窗口没了才开新窗(首次没 prelogin、或窗口意外掉线)；否则复用同一窗口
                     if mail_page is None:
@@ -933,7 +1070,12 @@ async def register_one(index, total, p):
                         await _renavigate_resend()
                     resend_at = time.time()  # 重发后只认此刻之后的新码
                     await asyncio.sleep(2)
-                code = await _fetch_email_code(received_after=resend_at)
+                code = await _fetch_email_code(
+                    received_after=resend_at,
+                    allow_browser_fallback=should_use_browser_mail_fallback(
+                        has_token, code_try
+                    ),
+                )
                 if code:
                     break
 
@@ -965,6 +1107,7 @@ async def register_one(index, total, p):
                 print("  no code received")
                 # 收不到码：只从 chatgpt 平台拉黑（记 emails_error_chatgpt.txt），其它平台仍可取
                 email_pool.mark_error(PLATFORM, email, email_pw, "no_code")
+                verification_code_failed = True
         # 兜底：关掉可能残留的预登录邮箱独立窗口（如 token 路径直接拿到码、或没进验证码分支）
         if mail_bb and mail_pid:
             try:
@@ -972,6 +1115,9 @@ async def register_one(index, total, p):
             except Exception:
                 pass
             mail_bb = mail_pid = mail_page = None
+        if verification_code_failed:
+            print("  [4][FAIL] verification code unavailable; stopping before onboarding")
+            return None
         check_timeout()
 
         # Step 5: onboarding（名字/生日）。账号 auth session 建立后禁止切换出口。
@@ -1098,12 +1244,108 @@ async def _raise_onboarding_error(page, index, auth_monitor=None):
     raise OnboardingRejected(f"{error['code']}: {error['message']}")
 
 
+async def recover_stuck_onboarding_session(page):
+    """Verify a completed account in a separate tab when about-you fails to navigate."""
+    probe = None
+    try:
+        from common.session_export import fetch_chatgpt_session
+
+        probe = await page.context.new_page()
+        await probe.goto(
+            "https://chatgpt.com/", timeout=45000, wait_until="domcontentloaded"
+        )
+        await asyncio.sleep(3)
+        session = await fetch_chatgpt_session(probe)
+        if not session:
+            return False
+        main_ui = probe.locator(
+            '[data-testid="composer-speech-button"], textarea, #prompt-textarea'
+        )
+        if await main_ui.count() == 0:
+            return False
+        print("  [onboarding] account session is valid despite stuck about-you URL")
+        await page.goto(
+            "https://chatgpt.com/", timeout=45000, wait_until="domcontentloaded"
+        )
+        return True
+    except Exception as error:
+        print(f"  [onboarding] session recovery check failed: {str(error)[:80]}")
+        return False
+    finally:
+        if probe is not None:
+            try:
+                await probe.close()
+            except Exception:
+                pass
+
+
+_REQUIRED_ONBOARDING_CONSENT_SELECTOR = ", ".join((
+    'input[type="checkbox"][name="personalInfoConsent"]',
+    'input[type="checkbox"][name="thirdPartyConsent"]',
+    'input[type="checkbox"][name="overseasTransferConsent"]',
+    'input[type="checkbox"][required]',
+    'input[type="checkbox"][aria-required="true"]',
+    '[role="checkbox"][aria-required="true"]',
+))
+
+
+async def ensure_required_onboarding_consents(page):
+    """Check required about-you consents without opting into optional choices."""
+    boxes = page.locator(_REQUIRED_ONBOARDING_CONSENT_SELECTOR)
+    total = await boxes.count()
+    checked = 0
+    changed = 0
+
+    async def is_checked(box):
+        try:
+            return bool(await box.is_checked())
+        except Exception:
+            return (await box.get_attribute("aria-checked")) == "true"
+
+    for i in range(total):
+        box = boxes.nth(i)
+        if await is_checked(box):
+            checked += 1
+            continue
+        try:
+            await box.check(force=True, timeout=4000)
+        except Exception:
+            try:
+                await box.click(force=True, timeout=4000)
+            except Exception:
+                try:
+                    await box.evaluate("""el => {
+                        if (el instanceof HTMLInputElement) {
+                            const setter = Object.getOwnPropertyDescriptor(
+                                HTMLInputElement.prototype, 'checked'
+                            )?.set;
+                            if (setter) setter.call(el, true);
+                            else el.checked = true;
+                            el.dispatchEvent(new Event('input', {bubbles: true}));
+                            el.dispatchEvent(new Event('change', {bubbles: true}));
+                        } else {
+                            el.click();
+                        }
+                    }""")
+                except Exception:
+                    continue
+        await asyncio.sleep(0.15)
+        if await is_checked(box):
+            checked += 1
+            changed += 1
+
+    if changed:
+        print(f"  [onboarding] accepted required consents: {checked}/{total}")
+    return total, checked
+
+
 async def click_finish_button(page, index, age_sel, auth_monitor=None, max_wait=12):
     """about-you 页专用：等 'Finish creating account' 按钮从 disabled 变可用后点击。
     返回是否点击成功。先尝试文案精确匹配，再退化为唯一非第三方登录按钮；
     若超时仍 disabled，dump 诊断（按钮 outerHTML + 各字段值 + 截图）便于排查。"""
     finish_labels = [
         "Finish creating account", "アカウントの作成を完了する",
+        "\uacc4\uc815 \uc0dd\uc131 \ub05d\ub0b4\uae30",
         "完成建立帳戶", "完成建立帳號", "完成創建帳戶", "完成創建帳號",
         "完成创建账户", "完成创建账号", "完成建立账户",
         "Selesaikan penciptaan akaun", "Selesaikan penciptaan",
@@ -1168,6 +1410,8 @@ async def click_finish_button(page, index, age_sel, auth_monitor=None, max_wait=
                         await _raise_onboarding_error(page, index, auth_monitor)
                         if "about-you" not in page.url.lower():
                             return True
+                    if await recover_stuck_onboarding_session(page):
+                        return True
                     # 仍没走：返回 False，让上层别再 re-fill(会重置 React 态、按钮重新 disabled)，
                     # 而是下一轮检测到还在 about-you 时只重试点击。
                     print("  [onboarding] 升级提交后仍在 about-you")
@@ -1266,6 +1510,14 @@ async def handle_onboarding(page, index, max_rounds=6, auth_monitor=None):
                     # 关键：失焦让 onBlur 校验跑起来，Finish 按钮才会解除 disabled
                     await blur_field(page, age_sel)
                     await asyncio.sleep(0.3)
+            consent_total, consent_checked = await ensure_required_onboarding_consents(page)
+            if consent_total and consent_checked < consent_total:
+                print(
+                    "  [onboarding] required consents are not ready: "
+                    f"{consent_checked}/{consent_total}"
+                )
+                await asyncio.sleep(1)
+                continue
             if await click_finish_button(
                 page, index, age_sel, auth_monitor=auth_monitor
             ):
@@ -1338,6 +1590,7 @@ async def handle_onboarding(page, index, max_rounds=6, auth_monitor=None):
         for label in [
                 # 具体完成按钮(优先)：英 / 日 / 繁(港台) / 简 / 马来(代理走马来节点时 OpenAI 返回 Bahasa Melayu)
                 "Finish creating account", "アカウントの作成を完了する",
+                "\uacc4\uc815 \uc0dd\uc131 \ub05d\ub0b4\uae30",
                 "完成建立帳戶", "完成建立帳號", "完成創建帳戶", "完成創建帳號",
                 "完成创建账户", "完成创建账号", "完成建立账户",
                 "Selesaikan penciptaan akaun", "Selesaikan penciptaan",

@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=">
 <title>reg-factory 控制面板</title>
-<link rel="stylesheet" href="/static/style.css?v=20260717-update-1">
+<link rel="stylesheet" href="/static/style.css?v=20260724-claude-1">
 </head>
 <body>
 <header class="topbar">
@@ -46,7 +46,10 @@
       </div>
       <div class="panel log-panel">
         <div class="log-head">
-          <span id="log-title">运行日志</span>
+          <div class="log-heading">
+            <span id="log-title">运行日志</span>
+            <span id="run-state" class="run-state idle" role="status" aria-live="polite">待运行</span>
+          </div>
           <button id="btn-stop" class="btn-stop" disabled>停止</button>
         </div>
         <pre id="log" class="log"></pre>
@@ -143,6 +146,6 @@
   <a href="https://t.me/TIANTIANAIPRO" target="_blank" rel="noopener">@TIANTIANAIPRO</a>
 </dialog>
 
-<script src="/static/app.js?v=20260717-update-1"></script>
+<script src="/static/app.js?v=20260724-claude-1"></script>
 </body>
 </html>

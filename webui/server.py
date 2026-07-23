@@ -11,6 +11,7 @@ webui/server.py — reg-factory 本地 Web 面板后端(FastAPI)。
 """
 import asyncio
 import contextlib
+import json
 import os
 import shutil
 import subprocess
@@ -835,7 +836,8 @@ async def api_run(request: Request):
     )
     _run_seq[0] += 1
     run_id = f"r{_run_seq[0]}"
-    rec = {"proc": proc, "lines": [], "done": False, "script": sid,
+    rec = {"proc": proc, "lines": [], "done": False, "stopped": False,
+           "returncode": None, "script": sid,
            "cmd": " ".join(cmd), "started": time.strftime("%H:%M:%S")}
     RUNS[run_id] = rec
 
@@ -849,6 +851,7 @@ async def api_run(request: Request):
             rec["lines"].append(f"[webui] 读取输出异常: {e}")
         finally:
             await proc.wait()
+            rec["returncode"] = proc.returncode
             rec["done"] = True
             rec["lines"].append(f"[webui] 进程结束 exit={proc.returncode}")
 
@@ -870,7 +873,14 @@ async def api_logs(run_id: str):
                 yield f"data: {lines[idx]}\n\n"
                 idx += 1
             if rec["done"] and idx >= len(rec["lines"]):
-                yield "event: done\ndata: end\n\n"
+                result = json.dumps(
+                    {
+                        "returncode": rec["returncode"],
+                        "stopped": rec["stopped"],
+                    },
+                    ensure_ascii=False,
+                )
+                yield f"event: done\ndata: {result}\n\n"
                 break
             await asyncio.sleep(0.4)
 
@@ -883,6 +893,7 @@ async def api_stop(run_id: str):
     if not rec:
         return JSONResponse({"error": "无此任务"}, status_code=404)
     if not rec["done"]:
+        rec["stopped"] = True
         try:
             rec["proc"].terminate()
         except Exception:

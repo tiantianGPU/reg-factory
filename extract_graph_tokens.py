@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import html
 import json
 import os
 import re
@@ -18,12 +19,18 @@ import sys
 import urllib.parse
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from html.parser import HTMLParser
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stdin.reconfigure(encoding="utf-8")
 
 import requests
+
+try:
+    import config  # noqa: F401  # load project .env for OUTLOOK_UI_LOCALE
+except Exception:
+    pass
 
 # Thunderbird client — public, supports personal accounts.
 # 用 Graph Mail.Read 资源域：下游 common/mailbox.get_code_by_token 走 Graph REST
@@ -33,6 +40,65 @@ CLIENT_ID = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
 REDIRECT_URI = "http://localhost"
 SCOPE = "offline_access https://graph.microsoft.com/Mail.Read"
 OUTPUT_DIR = "outlook_accounts"
+MICROSOFT_UI_LOCALE = os.environ.get("OUTLOOK_UI_LOCALE", "en-US").strip() or "en-US"
+
+
+class _MicrosoftFormParser(HTMLParser):
+    """Parse Microsoft forms independently of attribute order, quoting, or UI text."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.forms = []
+        self.inputs = {}
+        self._form = None
+
+    def handle_starttag(self, tag, attrs):
+        attributes = {str(key).lower(): value or "" for key, value in attrs}
+        if tag.lower() == "form":
+            if self._form is not None:
+                self.forms.append(self._form)
+            self._form = {
+                "action": attributes.get("action", ""),
+                "method": attributes.get("method", "post").lower(),
+                "inputs": {},
+            }
+        elif tag.lower() == "input":
+            name = attributes.get("name", "")
+            if not name:
+                return
+            value = attributes.get("value", "")
+            self.inputs[name.lower()] = value
+            if self._form is not None:
+                self._form["inputs"][name] = value
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "form" and self._form is not None:
+            self.forms.append(self._form)
+            self._form = None
+
+    def close(self):
+        super().close()
+        if self._form is not None:
+            self.forms.append(self._form)
+            self._form = None
+
+
+def _parse_microsoft_forms(text, base_url=""):
+    parser = _MicrosoftFormParser()
+    parser.feed(text or "")
+    parser.close()
+    forms = []
+    for form in parser.forms:
+        action = html.unescape(form["action"] or base_url)
+        forms.append({
+            **form,
+            "action": urllib.parse.urljoin(base_url, action),
+        })
+    return forms, parser.inputs
+
+
+def _redirect_url(response, location):
+    return urllib.parse.urljoin(getattr(response, "url", ""), html.unescape(location or ""))
 
 
 def get_graph_token(email, password, idx=0):
@@ -42,6 +108,7 @@ def get_graph_token(email, password, idx=0):
     session.trust_env = True  # Use system proxy (Clash) — avoids rate-limiting on account.live.com
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "Accept-Language": f"{MICROSOFT_UI_LOCALE},en;q=0.8",
     })
 
     try:
@@ -53,12 +120,15 @@ def get_graph_token(email, password, idx=0):
             f"&redirect_uri={urllib.parse.quote(REDIRECT_URI, safe='')}"
             f"&scope={urllib.parse.quote(SCOPE)}"
             f"&response_mode=query"
+            f"&mkt={urllib.parse.quote(MICROSOFT_UI_LOCALE)}"
+            f"&ui_locales={urllib.parse.quote(MICROSOFT_UI_LOCALE)}"
         )
         print(f"  {tag} {email} — fetching auth page...")
         resp = session.get(auth_url, timeout=30, allow_redirects=True)
 
         # Extract form data from MS login page
         text = resp.text
+        login_forms, page_inputs = _parse_microsoft_forms(text, resp.url)
 
         # Flow token (PPFT) — embedded in sFTTag as escaped HTML input
         flow_token = ""
@@ -66,10 +136,7 @@ def get_graph_token(email, password, idx=0):
         if sft_tag:
             flow_token = sft_tag.group(1)
         if not flow_token:
-            # Fallback: look for PPFT hidden input directly
-            ppft = re.search(r'name="PPFT"[^>]*value="([^"]+)"', text)
-            if ppft:
-                flow_token = ppft.group(1)
+            flow_token = page_inputs.get("ppft", "")
 
         # Post URL
         post_url = ""
@@ -88,7 +155,15 @@ def get_graph_token(email, password, idx=0):
             return None
 
         if not post_url:
-            post_url = "https://login.live.com/ppsecure/post.srf"
+            credential_form = next((
+                form for form in login_forms
+                if "ppft" in {name.lower() for name in form["inputs"]}
+            ), None)
+            post_url = (credential_form or {}).get("action") or (
+                "https://login.live.com/ppsecure/post.srf"
+            )
+        else:
+            post_url = urllib.parse.urljoin(resp.url, html.unescape(post_url))
 
         print(f"  {tag} submitting credentials...")
 
@@ -113,13 +188,14 @@ def get_graph_token(email, password, idx=0):
         # Follow JS auto-submit intermediate pages (Microsoft uses onload="DoSubmit()" forms)
         for _ in range(5):
             _html = resp2.text or ''
-            if ('DoSubmit' in _html or ('fmHF' in _html and 'onload' in _html)) and 'action=' in _html:
-                _m = re.search(r'action="([^"]+)"', _html)
-                if _m:
-                    _fa = _m.group(1).replace('&amp;', '&')
-                    _hid = re.findall(r'<input[^>]*name="([^"]*)"[^>]*value="([^"]*)"', _html)
-                    _fd = {n: v for n, v in _hid}
-                    resp2 = session.post(_fa, data=_fd, timeout=30, allow_redirects=True)
+            if ('dosubmit' in _html.lower() or ('fmhf' in _html.lower() and 'onload' in _html.lower())):
+                auto_forms, _ = _parse_microsoft_forms(_html, resp2.url)
+                if auto_forms:
+                    auto_form = auto_forms[0]
+                    resp2 = session.post(
+                        auto_form["action"], data=auto_form["inputs"],
+                        timeout=30, allow_redirects=True,
+                    )
                     continue
             break
 
@@ -128,7 +204,7 @@ def get_graph_token(email, password, idx=0):
         for step in range(15):
             # Handle HTTP redirects
             while resp2.status_code in (301, 302, 303, 307):
-                loc = resp2.headers.get("Location", "")
+                loc = _redirect_url(resp2, resp2.headers.get("Location", ""))
                 if "localhost" in loc and "code=" in loc:
                     resp2 = type('R', (), {'url': loc, 'text': '', 'status_code': 200})()
                     break
@@ -158,7 +234,7 @@ def get_graph_token(email, password, idx=0):
 
             # Consent/Update — Microsoft app consent page (React SPA, no static form).
             # Accept by POSTing ucaction=Yes with fields extracted from ServerData JS config.
-            if "Consent/Update" in url or "Consent/update" in url:
+            if "consent/update" in url.lower():
                 m_sd = re.search(r'ServerData\s*=\s*(\{.*?\});', text, re.DOTALL)
                 if m_sd:
                     sd = json.loads(m_sd.group(1))
@@ -177,18 +253,13 @@ def get_graph_token(email, password, idx=0):
 
             # proofs/Add — Microsoft asking to add security info.
             # Skip by setting action="Skip" and submitting the form (mirrors JS: jQuery("#action").val("Skip"))
-            if "proofs/Add" in url or "proofs/add" in url:
-                form_match2 = re.search(r'<form[^>]*action="([^"]+)"[^>]*>(.*?)</form>',
-                                        text, re.DOTALL | re.IGNORECASE)
-                if form_match2:
-                    form_action2 = form_match2.group(1).replace("&amp;", "&")
-                    form_body2 = form_match2.group(2)
-                    hidden2 = re.findall(r'<input[^>]*name="([^"]*)"[^>]*value="([^"]*)"', form_body2)
-                    form_data2 = {n: v for n, v in hidden2}
+            if "proofs/add" in url.lower():
+                proof_forms, _ = _parse_microsoft_forms(text, url)
+                if proof_forms:
+                    proof_form = proof_forms[0]
+                    form_action2 = proof_form["action"]
+                    form_data2 = dict(proof_form["inputs"])
                     form_data2["action"] = "Skip"  # simulate Skip button click
-                    if not form_action2.startswith("http"):
-                        base2 = urllib.parse.urlparse(url)
-                        form_action2 = f"{base2.scheme}://{base2.netloc}{form_action2}"
                     print(f"  {tag} skipping proofs/Add (action=Skip) -> {form_action2[:80]}...")
                     resp2 = session.post(form_action2, data=form_data2, timeout=30, allow_redirects=False)
                     continue
@@ -196,27 +267,22 @@ def get_graph_token(email, password, idx=0):
                 return None
 
             # Find and submit any form on the page (consent, redirect, etc.)
-            form_match = re.search(r'<form[^>]*action="([^"]+)"[^>]*>(.*?)</form>', text, re.DOTALL | re.IGNORECASE)
-            if form_match:
-                form_action = form_match.group(1).replace("&amp;", "&")
-                form_body = form_match.group(2)
-                hidden = re.findall(r'<input[^>]*name="([^"]*)"[^>]*value="([^"]*)"', form_body)
-                form_data = {name: val for name, val in hidden}
+            forms, _ = _parse_microsoft_forms(text, url)
+            if forms:
+                form = forms[0]
+                form_action = form["action"]
+                form_data = dict(form["inputs"])
 
                 # For consent pages, add accept
                 if "consent" in form_action.lower() or "consent" in url.lower():
                     form_data["ucaccept"] = "Yes"
                     print(f"  {tag} submitting consent...")
 
-                if not form_action.startswith("http"):
-                    base = urllib.parse.urlparse(url)
-                    form_action = f"{base.scheme}://{base.netloc}{form_action}"
-
                 # Don't follow redirect to localhost (it will fail)
                 resp2 = session.post(form_action, data=form_data, timeout=30, allow_redirects=False)
                 # Follow redirects but catch localhost
                 while resp2.status_code in (301, 302, 303, 307):
-                    loc = resp2.headers.get("Location", "")
+                    loc = _redirect_url(resp2, resp2.headers.get("Location", ""))
                     if "localhost" in loc:
                         resp2 = type('R', (), {'url': loc, 'text': '', 'status_code': 200})()
                         break

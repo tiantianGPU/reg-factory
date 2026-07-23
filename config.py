@@ -40,6 +40,13 @@ def _env(name, default=""):
     return os.environ.get(name, default)
 
 
+def _env_int(name, default):
+    try:
+        return int(_env(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return int(default)
+
+
 # ---------------------------------------------------------------- 本地基建
 # Fingerprint browser provider: bitbrowser / adspower
 FINGERPRINT_BROWSER = _env("FINGERPRINT_BROWSER", "bitbrowser").strip().lower()
@@ -54,6 +61,15 @@ ADSPOWER_GROUP_ID = _env("ADSPOWER_GROUP_ID", "0")
 
 # Claude.ai 注册相关 URL
 CLAUDE_LOGIN_URL = "https://claude.ai/login"
+CLAUDE_CHALLENGE_WAIT_SECONDS = _env_int("CLAUDE_CHALLENGE_WAIT_SECONDS", 45)
+CLAUDE_CHALLENGE_NODE_RETRIES = _env_int("CLAUDE_CHALLENGE_NODE_RETRIES", 3)
+CLAUDE_CAPTCHA_MANUAL_TIMEOUT = _env_int("CLAUDE_CAPTCHA_MANUAL_TIMEOUT", 0)
+CLAUDE_HCAPTCHA_SOLVE_RETRIES = _env_int("CLAUDE_HCAPTCHA_SOLVE_RETRIES", 2)
+CLAUDE_VISION_API_BASE = _env("CLAUDE_VISION_API_BASE", "")
+CLAUDE_VISION_API_KEY = _env("CLAUDE_VISION_API_KEY", "")
+CLAUDE_VISION_MODEL = _env("CLAUDE_VISION_MODEL", "gemini-3.6-flash")
+CLAUDE_NODE_PROBE_LIMIT = _env_int("CLAUDE_NODE_PROBE_LIMIT", 6)
+CLAUDE_NODE_PROBE_TIMEOUT_SECONDS = _env_int("CLAUDE_NODE_PROBE_TIMEOUT_SECONDS", 8)
 
 # Cookie 输出目录
 COOKIE_OUTPUT_DIR = "cookies"

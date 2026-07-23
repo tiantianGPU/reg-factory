@@ -80,13 +80,27 @@ def node_delay(name, url="https://www.google.com/generate_204", timeout_ms=5000)
 
 
 def concrete_nodes(group=DEFAULT_GROUP):
-    """只返回具体节点(排除'自动适配'这类子组)——名字里带数字的"""
+    """Return leaf proxies, including country-only names without digits."""
     metadata = ("套餐", "剩余", "重置", "到期", "官网", "http://", "https://")
-    return [
-        n for n in list_nodes(group)
-        if any(c.isdigit() for c in n)
-        and not any(marker in n for marker in metadata)
-    ]
+    names = list_nodes(group)
+    try:
+        catalog = (_get("/proxies").get("proxies") or {})
+        group_types = {"Selector", "URLTest", "Fallback", "LoadBalance"}
+        return [
+            name for name in names
+            if name not in {"DIRECT", "REJECT"}
+            and not any(marker in name for marker in metadata)
+            and (catalog.get(name) or {}).get("type") not in group_types
+        ]
+    except Exception:
+        # Older Clash controllers may not expose the full catalog. Preserve the
+        # old numbered-node fallback while also accepting flag-prefixed leaves.
+        return [
+            name for name in names
+            if (any(char.isdigit() for char in name)
+                or (name and 0x1F1E6 <= ord(name[0]) <= 0x1F1FF))
+            and not any(marker in name for marker in metadata)
+        ]
 
 
 def find_working_node(test_url="https://grok.com/", group=DEFAULT_GROUP,

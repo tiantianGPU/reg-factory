@@ -1,5 +1,33 @@
 ﻿# 更新日志
 
+## 2026-07-24 — Claude / ChatGPT 注册稳定性、Outlook Graph 与 WebUI
+
+**Claude**
+- `--node auto` 改为限量快速探测并优先回退最近可用节点；发送 magic-link、原生 nonce 验证和浏览器 API 验证均先检查路由，地区限制或 Cloudflare 页面不会提前消耗打码任务。
+- hCaptcha 优先走本地视觉求解，兼容 DOM tile、canvas 点击和拖拽；新增多语言题干识别、珠链长度本地检测、两条线端点点击及多模型投票回退，YesCaptcha 保留为备用并支持瞬时失败重试。
+- magic-link 原生验证遇到 403 会保留同一浏览器会话重试，HTTP 200 后把登录 cookie 注入页面并完成 onboarding；成功产物保存为 `tokens/claude/<email>.sessionKey.json`。
+- sessionKey 校验复用 Clash 出口和现代 Chromium 指纹，避免注册成功后被旧内核或直连出口误判失效。
+
+**ChatGPT**
+- 邮箱提交、验证码、密码与 onboarding 状态判断改为基于可见控件和认证请求；收不到验证码时在进入 onboarding 前明确失败。
+- about-you 页面提交前自动勾选必选同意项，兼容多语言完成按钮与 React 表单兜底提交，修复按钮始终 disabled 的卡死。
+- 注册期间固定 Clash 出口，自动探测节点失败时给出明确错误，避免认证中途换 IP。
+
+**Outlook / Graph**
+- Outlook 注册成功后优先在当前登录浏览器上下文完成 Graph OAuth，并为每条 refresh token 保存实际签发的 `client_id`；失败时才回退纯 HTTP 补抽。
+- 注册与 Graph 授权改为稳定控件 ID、字段元数据优先，兼容常见欧洲及亚洲语言；HTTP 回退支持不同属性顺序、引号和相对表单地址。
+- 单次超时关闭 BitBrowser 时忽略预期的 Playwright `TargetClosedError` 后台噪声，其他异步异常仍正常上报。
+
+**WebUI**
+- Claude 任务页补齐 `client-id`、节点轮换和人工接管参数；配置页新增节点探测、hCaptcha 重试、视觉网关、模型和浏览器内核设置。
+- 宽屏使用参数/日志双栏，移动端保持单栏抽屉导航；日志区显示待运行、运行中、成功、失败和停止状态，并从 SSE 结束事件读取真实退出码。
+
+**验证**
+- 新账号实测 Claude 注册 `1/1`，成功保存并校验 sessionKey；ChatGPT 新账号注册完成 onboarding 并取得有效 session。
+- 自动化回归：Claude / ChatGPT / WebUI 91 项通过，Outlook Graph 20 项通过；桌面 1440×900 与移动端 390×844 无横向溢出或控件重叠。
+
+---
+
 ## 2026-07-14 — Grok 纯 HTTP 协议注册（不开浏览器） + WebUI 接入 + 移除 ruyi 版
 
 **新增**

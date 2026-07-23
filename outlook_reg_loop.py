@@ -42,6 +42,7 @@ EMAILS_POOL = os.path.join(ARTIFACT_DIR, "emails.txt")
 # 注册成功但 Graph refresh_token 抽取失败的号：邮箱+密码单独存这里，别丢。
 # 之后可用 extract_graph_tokens.py 对这个文件补抽 RT，或浏览器登录直接用。
 NO_GRAPH_POOL = os.path.join(ARTIFACT_DIR, "outlook_no_graph.txt")
+DEFAULT_MAX_PRESS = "5"
 
 STANDALONE_PATH = os.environ.get(
     "SELF_REG_SCRIPT_PATH",
@@ -582,7 +583,7 @@ def write_record(record):
 
 
 async def _run_outlook_on_ctx(mod, ctx, idx):
-    """Scrub residual state -> 新页注册 -> 导出 outlook 相关 cookie。"""
+    """Register, export cookies, then obtain Graph RT in the live login session."""
     # Scrub Chromium residual state so signup.live.com doesn't see a
     # stale identity from a previous session.
     try:
@@ -602,6 +603,7 @@ async def _run_outlook_on_ctx(mod, ctx, idx):
     page = await ctx.new_page()
     email, password = await mod.register_outlook(page, ctx, idx)
     cookies = []
+    graph = None
     if email:
         try:
             all_cookies = await ctx.cookies()
@@ -616,7 +618,19 @@ async def _run_outlook_on_ctx(mod, ctx, idx):
             ]
         except Exception as e:
             log(f"cookie export failed: {e}", "WARN")
-    return email, password, cookies
+        try:
+            log(f"graph browser-session extraction start: {email}")
+            graph = await mod.extract_graph_token(page, ctx, email, password, idx)
+            if graph and graph.get("refresh_token"):
+                graph["client_id"] = graph.get("client_id") or mod.GRAPH_CLIENT_ID
+                log(f"graph token extracted from live browser session: {email}", "OK")
+            else:
+                graph = None
+                log(f"graph browser-session extraction returned no RT: {email}", "WARN")
+        except Exception as e:
+            log(f"graph browser-session extraction failed: {type(e).__name__}: {e}", "WARN")
+            graph = None
+    return email, password, cookies, graph
 
 
 async def one_attempt(mod, proxy_str, idx):
@@ -647,17 +661,17 @@ async def one_attempt(mod, proxy_str, idx):
                 log(f"create_browser err (try {_r+1}/5): {m[:200]}", "WARN")
                 await asyncio.sleep(3 + _r)
         if not profile_id:
-            return None, None, []
+            return None, None, [], None
         info = bb.open_browser(profile_id)
         ws = info.get("ws", "")
         if not ws:
-            return None, None, []
+            return None, None, [], None
         from playwright.async_api import async_playwright as _apw
         async with _apw() as p:
             browser = await p.chromium.connect_over_cdp(ws)
             ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
-            email, password, cookies = await _run_outlook_on_ctx(mod, ctx, idx)
-        return email, password, cookies
+            email, password, cookies, graph = await _run_outlook_on_ctx(mod, ctx, idx)
+        return email, password, cookies, graph
     finally:
         if profile_id:
             try:
@@ -668,6 +682,23 @@ async def one_attempt(mod, proxy_str, idx):
                 pass
 
 
+def _playwright_shutdown_exception_handler(loop, context):
+    """Ignore only detached Playwright futures after a timed-out profile closes."""
+    error = context.get("exception")
+    message = str(error or context.get("message") or "")
+    if type(error).__name__ == "TargetClosedError" or (
+        "Target page, context or browser has been closed" in message
+    ):
+        return
+    loop.default_exception_handler(context)
+
+
+async def _one_attempt_with_timeout(mod, proxy_str, idx, timeout):
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(_playwright_shutdown_exception_handler)
+    return await asyncio.wait_for(one_attempt(mod, proxy_str, idx), timeout=timeout)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--count", type=int, default=0,
@@ -675,7 +706,7 @@ def main():
     ap.add_argument("--target-pool", type=int, default=0,
                     help="stop registering once pool dir has this many records "
                          "(0 = no cap; producer always runs)")
-    ap.add_argument("--max-press", default="3",
+    ap.add_argument("--max-press", default=DEFAULT_MAX_PRESS,
                     help="OUTLOOK_REG_MAX_PRESS — captcha press-and-hold cap")
     ap.add_argument("--confirm-before-register", action="store_true",
                     help="auto-click confirmation on the signup page before filling")
@@ -752,15 +783,18 @@ def main():
         t0 = time.time()
         email = password = None
         cookies = []
+        graph = None
         try:
-            email, password, cookies = asyncio.run(
-                asyncio.wait_for(one_attempt(mod, proxy, n), timeout=args.timeout)
+            email, password, cookies, graph = asyncio.run(
+                _one_attempt_with_timeout(mod, proxy, n, args.timeout + 90)
             )
         except Exception as e:
             log(f"attempt raised {type(e).__name__}: {str(e)[:200]}", "WARN")
         elapsed = time.time() - t0
         if email and password:
-            graph = extract_graph_for_account(email, password)
+            if not graph or not graph.get("refresh_token"):
+                log(f"live browser RT unavailable; falling back to pure HTTP: {email}", "WARN")
+                graph = extract_graph_for_account(email, password)
             if not graph or not graph.get("refresh_token"):
                 failed += 1
                 append_no_graph_account(email, password)  # 号有效但没抽到 RT：单独存待补

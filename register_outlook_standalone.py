@@ -19,11 +19,14 @@ import re
 import string
 import sys
 import time
+import urllib.parse
 from datetime import datetime
 
 if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stdin.reconfigure(encoding="utf-8")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(encoding="utf-8")
 
 import requests
 from playwright.async_api import async_playwright
@@ -528,11 +531,666 @@ async def inject_arkose_token(page, token):
 
 # ======================== Graph API Token ========================
 
-# Microsoft public client for personal accounts (consumers tenant)
-# Using Outlook Mobile client ID which supports personal accounts
-GRAPH_CLIENT_ID = "27922004-5251-4030-b22d-91ecd9a37ea4"
-GRAPH_REDIRECT_URI = "https://login.microsoftonline.com/common/oauth2/nativeclient"
-GRAPH_SCOPE = "offline_access https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/User.Read"
+# Thunderbird's public client is enabled for consumer Microsoft accounts and
+# is also used by extract_graph_tokens.py. Keep each RT paired with this ID.
+GRAPH_CLIENT_ID = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+GRAPH_REDIRECT_URI = "http://localhost"
+GRAPH_SCOPE = "offline_access https://graph.microsoft.com/Mail.Read"
+GRAPH_DEVICE_CODE_URL = (
+    "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode"
+)
+GRAPH_TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+MICROSOFT_UI_LOCALE = os.environ.get("OUTLOOK_UI_LOCALE", "en-US").strip() or "en-US"
+
+# Microsoft occasionally ignores mkt/ui_locales and renders according to the exit IP.
+# Keep text matching as a fallback, but prefer stable element IDs and field metadata.
+MS_POSITIVE_ACTION_LABELS = (
+    "accept", "allow", "continue", "yes", "agree", "next", "ok",
+    "agree and continue", "i agree", "got it",
+    "\u662f",
+    "accepter", "autoriser", "continuer", "oui", "j'accepte", "suivant",
+    "aceptar", "permitir", "continuar", "sí", "siguiente", "acepto",
+    "akzeptieren", "zulassen", "weiter", "ja", "zustimmen",
+    "aceitar", "permitir", "continuar", "sim", "avançar", "concordo",
+    "accetta", "consenti", "continua", "sì", "avanti", "accetto",
+    "accepteren", "toestaan", "doorgaan", "ja", "volgende", "akkoord",
+    "zaakceptuj", "zezwól", "kontynuuj", "tak", "dalej", "zgadzam się",
+    "принять", "разрешить", "продолжить", "да", "далее", "согласен",
+    "kabul et", "izin ver", "devam et", "evet", "ileri", "kabul ediyorum",
+    "قبول", "السماح", "متابعة", "نعم", "التالي", "موافق", "أوافق",
+    "接受", "允许", "同意", "继续", "下一步", "确定",
+    "允許", "繼續", "下一步", "確定",
+    "承諾", "許可", "続行", "次へ", "はい", "同意する",
+    "동의", "허용", "계속", "다음", "예", "확인",
+)
+MS_NEGATIVE_ACTION_LABELS = (
+    "deny", "decline", "cancel", "no", "back",
+    "\u5426",
+    "refuser", "annuler", "non",
+    "rechazar", "denegar", "cancelar", "no",
+    "ablehnen", "abbrechen", "nein",
+    "recusar", "negar", "cancelar", "não",
+    "rifiuta", "nega", "annulla", "no",
+    "weigeren", "annuleren", "nee",
+    "odrzuć", "anuluj", "nie",
+    "отклонить", "отмена", "нет",
+    "reddet", "iptal", "hayır",
+    "رفض", "إلغاء", "لا", "رجوع",
+    "拒绝", "拒絕", "取消", "否", "いいえ", "拒否", "취소", "거부", "아니요",
+)
+MS_SKIP_ACTION_LABELS = (
+    "skip for now", "skip", "not now", "no thanks", "maybe later", "later",
+    "ignorer pour le moment", "ignorer", "pas maintenant", "non merci", "plus tard",
+    "omitir por ahora", "omitir", "ahora no", "no, gracias", "más tarde",
+    "vorerst überspringen", "überspringen", "nicht jetzt", "nein, danke", "später",
+    "ignorar por enquanto", "ignorar", "agora não", "não, obrigado", "mais tarde",
+    "ignora per ora", "ignora", "non ora", "no, grazie", "più tardi",
+    "voorlopig overslaan", "overslaan", "niet nu", "nee, bedankt", "later",
+    "pomiń na razie", "pomiń", "nie teraz", "nie, dziękuję", "później",
+    "пропустить", "не сейчас", "нет, спасибо", "позже",
+    "şimdilik atla", "atla", "şimdi değil", "hayır, teşekkürler", "daha sonra",
+    "تخطي الآن", "تخطي", "ليس الآن", "لا شكرًا", "ربما لاحقًا", "لاحقًا",
+    "暂时跳过", "跳过", "现在不", "以后再说", "不用了",
+    "暫時略過", "略過", "現在不要", "稍後再說",
+    "今はしない", "スキップ", "後で", "건너뛰기", "나중에", "지금은 안 함",
+)
+
+
+def _microsoft_url_with_locale(url):
+    """Add locale hints without overwriting OAuth/device-code parameters."""
+    parsed = urllib.parse.urlsplit(url)
+    params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    existing = {key.lower() for key, _ in params}
+    if "mkt" not in existing:
+        params.append(("mkt", MICROSOFT_UI_LOCALE))
+    if "ui_locales" not in existing:
+        params.append(("ui_locales", MICROSOFT_UI_LOCALE))
+    return urllib.parse.urlunsplit((
+        parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(params), parsed.fragment
+    ))
+
+
+async def _click_microsoft_action(
+    page, labels=MS_POSITIVE_ACTION_LABELS, negative_labels=MS_NEGATIVE_ACTION_LABELS,
+    preferred_ids=(),
+):
+    """Click a visible Microsoft action using IDs first and localized text second."""
+    try:
+        return await page.evaluate(r"""({labels, negativeLabels, preferredIds}) => {
+            const normalize = value => String(value || '')
+                .replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+            const visible = el => {
+                const style = getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return !el.disabled && el.getAttribute('aria-disabled') !== 'true'
+                    && style.display !== 'none' && style.visibility !== 'hidden'
+                    && rect.width > 0 && rect.height > 0;
+            };
+            const textOf = el => normalize(
+                el.value || el.innerText || el.textContent
+                || el.getAttribute('aria-label') || el.getAttribute('title')
+            );
+            const blocked = text => negativeLabels.some(label =>
+                text === label || text.startsWith(label + ' ')
+            );
+            for (const id of preferredIds) {
+                const el = document.getElementById(id);
+                if (el && visible(el) && !blocked(textOf(el))) {
+                    el.click();
+                    return textOf(el) || '#' + id;
+                }
+            }
+            const controls = document.querySelectorAll(
+                'button, a[role="button"], input[type="submit"], '
+                + 'input[type="button"], [role="button"]'
+            );
+            for (const el of controls) {
+                if (!visible(el)) continue;
+                const text = textOf(el);
+                if (!text || blocked(text)) continue;
+                if (labels.some(label => text === label || text.startsWith(label + ' '))) {
+                    el.click();
+                    return text;
+                }
+            }
+            const positiveIdentifiers = new Set([
+                'accept', 'allow', 'approve', 'consent', 'continue',
+                'next', 'yes', 'confirm', 'primary'
+            ]);
+            const negativeIdentifiers = new Set([
+                'deny', 'decline', 'reject', 'cancel', 'no', 'back', 'secondary'
+            ]);
+            for (const el of controls) {
+                if (!visible(el)) continue;
+                const semantic = normalize([
+                    el.id, el.getAttribute('name'), el.getAttribute('data-testid'),
+                    el.getAttribute('data-test-id'), el.getAttribute('aria-label')
+                ].filter(Boolean).join(' '));
+                const tokens = semantic.split(/[^a-z0-9]+/).filter(Boolean);
+                if (tokens.some(token => negativeIdentifiers.has(token))) continue;
+                if (tokens.some(token => positiveIdentifiers.has(token))) {
+                    el.click();
+                    return semantic || textOf(el);
+                }
+            }
+            return '';
+        }""", {
+            "labels": [label.lower() for label in labels],
+            "negativeLabels": [label.lower() for label in negative_labels],
+            "preferredIds": list(preferred_ids),
+        })
+    except Exception:
+        return ""
+
+
+def _birthdate_field_kind(metadata):
+    """Classify a birth-date field from stable metadata across UI locales."""
+    value = " ".join(str(metadata.get(key) or "") for key in (
+        "id", "name", "ariaLabel", "placeholder", "text"
+    )).lower()
+    stable_tokens = (
+        ("month", ("birthmonth",)),
+        ("year", ("birthyear",)),
+        ("country", ("country", "region")),
+        ("day", ("birthday", "birthdate")),
+    )
+    for kind, kind_tokens in stable_tokens:
+        if any(token in value for token in kind_tokens):
+            return kind
+    tokens = {
+        "month": ("birthmonth", "month", "mois", "mes", "monat", "mês", "mese",
+                  "maand", "miesiąc", "месяц", "月", "월"),
+        "day": ("birthday", "birthdate", "day", "jour", "día", "dia", "tag",
+                "giorno", "dag", "dzień", "день", "gün", "日", "일"),
+        "year": ("birthyear", "year", "année", "año", "ano", "jahr", "anno",
+                 "jaar", "rok", "год", "yıl", "年", "년"),
+        "country": ("country", "region", "pays", "país", "land", "paese",
+                    "kraj", "страна", "ülke", "国家", "國家", "国", "국가"),
+    }
+    if value.strip() == "ay":
+        return "month"
+    # Stable IDs such as BirthMonthDropdown contain "birthday" as a substring.
+    for kind in ("month", "year", "country", "day"):
+        if any(token in value for token in tokens[kind]):
+            return kind
+    return ""
+
+
+async def _select_birthdate_combo_option(page, combo, value):
+    """Select a numeric month/day option without relying on translated names."""
+    await combo.click(force=True)
+    await asyncio.sleep(0.5)
+    try:
+        clicked = await page.evaluate(r"""value => {
+            const visible = el => {
+                const rect = el.getBoundingClientRect();
+                const style = getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0
+                    && style.display !== 'none' && style.visibility !== 'hidden'
+                    && el.getAttribute('aria-disabled') !== 'true';
+            };
+            const options = [...document.querySelectorAll(
+                '[role="option"], [role="menuitemradio"], option'
+            )].filter(visible);
+            const numericValue = el => {
+                const candidates = [
+                    el.getAttribute('data-value'), el.getAttribute('value'),
+                    el.getAttribute('aria-label'), el.textContent
+                ];
+                for (const candidate of candidates) {
+                    const match = String(candidate || '').trim().match(/^(\d{1,2})(?:\D.*)?$/);
+                    if (match) return Number(match[1]);
+                }
+                return null;
+            };
+            let target = options.find(option => numericValue(option) === Number(value));
+            if (!target && options.length >= 12) {
+                // Text-only month lists still have a stable chronological order.
+                target = options[Number(value) - 1];
+            }
+            if (!target) return false;
+            target.click();
+            return true;
+        }""", int(value))
+    except Exception:
+        clicked = False
+    if not clicked:
+        await page.keyboard.type(str(value))
+        await page.keyboard.press("Enter")
+    await asyncio.sleep(0.5)
+    return True
+
+
+async def _select_native_numeric_option(select, value):
+    """Select month/day from a native select with localized option labels."""
+    for candidate in (str(value), f"{value:02d}"):
+        try:
+            await select.select_option(value=candidate)
+            return True
+        except Exception:
+            pass
+    try:
+        options = select.locator("option")
+        count = await options.count()
+        for index in range(count):
+            option = options.nth(index)
+            option_value = (await option.get_attribute("value") or "").strip()
+            option_text = (await option.text_content() or "").strip()
+            for candidate in (option_value, option_text):
+                match = re.match(r"^(\d{1,2})(?:\D.*)?$", candidate)
+                if match and int(match.group(1)) == value:
+                    await select.select_option(index=index)
+                    return True
+        # Localized month names retain chronological order. A 13th item is
+        # normally the placeholder; a 12-item list starts directly at January.
+        if count >= 13 and value <= 12:
+            await select.select_option(index=value)
+            return True
+        if count >= 12 and value <= 12:
+            await select.select_option(index=value - 1)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def _signup_email_rejected(page, email_input):
+    """Detect a rejected alias from field validity/ARIA before localized text."""
+    try:
+        if await email_input.count() == 0:
+            return ""
+        state = await email_input.evaluate(r"""el => {
+            const described = (el.getAttribute('aria-describedby') || '')
+                .split(/\s+/).filter(Boolean)
+                .map(id => document.getElementById(id)?.innerText || '').join(' ');
+            const nearby = el.closest('form, [role="main"], main')?.innerText || '';
+            return {
+                invalid: el.getAttribute('aria-invalid') === 'true'
+                    || (el.validity && !el.validity.valid),
+                message: [el.validationMessage, described, nearby].join(' ').toLowerCase(),
+                visible: !!el.offsetParent,
+            };
+        }""", timeout=1000)
+    except Exception:
+        state = {}
+    if state.get("invalid"):
+        return "format"
+    # Remaining on the alias field after submit normally means the alias was rejected.
+    if state.get("visible"):
+        message = state.get("message") or ""
+        format_markers = (
+            "valid", "format", "letter", "caractère", "formato", "gültig",
+            "válido", "valido", "corretto", "geldig", "prawidł", "допустим",
+            "geçerli", "格式", "有效", "文字", "올바른",
+        )
+        if any(marker in message for marker in format_markers):
+            return "format"
+        return "taken"
+    return ""
+
+
+def _microsoft_direct_session():
+    """Exchange OAuth codes directly; signup proxy state must not affect Graph."""
+    session = requests.Session()
+    session.trust_env = False
+    session.proxies = {"http": None, "https": None}
+    return session
+
+
+def _request_graph_device_code():
+    session = _microsoft_direct_session()
+    try:
+        response = session.post(
+            GRAPH_DEVICE_CODE_URL,
+            data={"client_id": GRAPH_CLIENT_ID, "scope": GRAPH_SCOPE},
+            timeout=30,
+        )
+        data = response.json()
+    except Exception as e:
+        print(f"  [graph] device-code request error: {str(e)[:120]}")
+        return None
+    finally:
+        session.close()
+    if response.status_code == 200 and data.get("device_code") and data.get("user_code"):
+        return data
+    error = data.get("error_description") or data.get("error") or "unknown error"
+    print(f"  [graph] device-code request failed: {str(error)[:140]}")
+    return None
+
+
+def _exchange_graph_device_code(device_code):
+    """Perform one non-blocking device-code token poll."""
+    session = _microsoft_direct_session()
+    try:
+        response = session.post(
+            GRAPH_TOKEN_URL,
+            data={
+                "client_id": GRAPH_CLIENT_ID,
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device_code,
+            },
+            timeout=30,
+        )
+        data = response.json()
+    except Exception as e:
+        return "retry", {"error_description": str(e)}
+    finally:
+        session.close()
+    if response.status_code == 200 and data.get("access_token"):
+        data["client_id"] = GRAPH_CLIENT_ID
+        return "ready", data
+    error = data.get("error") or ""
+    if error in {"authorization_pending", "slow_down"}:
+        return "pending", data
+    return "failed", data
+
+
+async def _skip_optional_recovery_email(page, idx=0):
+    """Skip optional recovery/alternate-email enrollment in any common locale."""
+    tag = f"[#{idx}]"
+    try:
+        body = " ".join(
+            (await page.locator("body").inner_text(timeout=3000)).split()
+        ).lower()
+    except Exception:
+        return False, False
+    try:
+        current_url = (page.url or "").lower()
+    except Exception:
+        current_url = ""
+    page_markers = (
+        "recovery email", "alternate email", "add an email address",
+        "security info", "help us protect your account",
+        "adresse e-mail de récupération", "informations de sécurité",
+        "correo de recuperación", "información de seguridad",
+        "wiederherstellungs-e-mail", "sicherheitsinformationen",
+        "email de recuperação", "informações de segurança",
+        "email di recupero", "informazioni di sicurezza",
+        "herstel-e-mailadres", "beveiligingsgegevens",
+        "adres e-mail odzyskiwania", "informacje zabezpieczające",
+        "резервный адрес электронной почты", "сведения для защиты",
+        "kurtarma e-postası", "güvenlik bilgileri",
+        "辅助邮箱", "恢复邮箱", "备用邮箱", "添加电子邮件",
+        "帮助我们保护你的帐户", "協助我們保護您的帳戶",
+        "復原電子郵件", "備用電子郵件", "セキュリティ情報",
+        "回復用メール", "보안 정보", "복구 이메일",
+    )
+    detected = "/proofs/add" in current_url or any(marker in body for marker in page_markers)
+    if not detected:
+        return False, False
+    clicked = await _click_microsoft_action(
+        page, labels=MS_SKIP_ACTION_LABELS, negative_labels=(),
+        preferred_ids=("iShowSkip", "idBtn_Skip", "skipBtn", "Skip"),
+    )
+    if clicked:
+        print(f"  {tag} [graph] skipped optional recovery email")
+        await asyncio.sleep(2)
+        return True, True
+    return True, False
+
+
+async def _skip_optional_passkey(page, idx=0):
+    """Cancel optional Microsoft passkey enrollment without opening native UI."""
+    tag = f"[#{idx}]"
+    try:
+        body = " ".join(
+            (await page.locator("body").inner_text(timeout=3000)).split()
+        ).lower()
+    except Exception:
+        return False, False
+    try:
+        current_url = (page.url or "").lower()
+    except Exception:
+        current_url = ""
+    markers = (
+        "setting up your passkey", "set up a passkey", "create a passkey",
+        "passkey", "security key", "clé d’accès", "clave de acceso",
+        "passschlüssel", "chave de acesso", "chiave di accesso",
+        "wachtwoordsleutel", "klucz dostępu", "ключ доступа", "geçiş anahtarı",
+        "通行密钥", "密碼金鑰", "パスキー", "패스키",
+    )
+    detected = "passkey" in current_url or any(marker in body for marker in markers)
+    if not detected:
+        return False, False
+    clicked = await _click_microsoft_action(
+        page, labels=("cancel", "annuler", "cancelar", "abbrechen", "annulla",
+                           "annuleren", "anuluj", "отмена", "iptal", "取消",
+                           "キャンセル", "취소") + MS_SKIP_ACTION_LABELS,
+        negative_labels=(),
+        preferred_ids=("idBtn_Back", "iCancel", "cancelBtn", "skipBtn"),
+    )
+    if clicked:
+        print(f"  {tag} [graph] skipped optional passkey setup")
+        await asyncio.sleep(2)
+        return True, True
+    return True, False
+
+
+async def _accept_microsoft_app_consent(page, idx=0):
+    """Accept the Device Code app-consent interstitial without selecting Deny."""
+    tag = f"[#{idx}]"
+    try:
+        current_url = (page.url or "").lower()
+    except Exception:
+        current_url = ""
+    try:
+        body = " ".join(
+            (await page.locator("body").inner_text(timeout=3000)).split()
+        ).lower()
+    except Exception:
+        body = ""
+    detected = (
+        "/consent/update" in current_url
+        or "let this app access your info" in body
+        or "needs your permission" in body
+        or "允许此应用访问你的信息" in body
+        or "讓此應用程式存取您的資訊" in body
+        or "このアプリが情報にアクセスすることを許可" in body
+        or "이 앱이 사용자 정보에 액세스하도록 허용" in body
+        or "autoriser cette application à accéder" in body
+        or "permitir que esta aplicación acceda" in body
+        or "dieser app den zugriff" in body
+        or "permitir que este aplicativo acesse" in body
+        or "consenti a questa app di accedere" in body
+        or "deze app toegang geven" in body
+        or "zezwolić tej aplikacji na dostęp" in body
+        or "разрешить этому приложению доступ" in body
+        or "bu uygulamanın bilgilerinize erişmesine izin ver" in body
+        or "هل تريد السماح لهذا التطبيق" in body
+        or "يحتاج thunderbird للحصول على إذنك" in body
+    )
+    if not detected:
+        return False, False
+    clicked = await _click_microsoft_action(
+        page, preferred_ids=("idBtn_Accept", "acceptButton", "iAgree", "idSIButton9"),
+    )
+    if clicked:
+        print(f"  {tag} [graph] accepted Microsoft app consent")
+        await asyncio.sleep(2)
+        return True, True
+    print(f"  {tag} [graph] app consent detected; Accept control not ready")
+    return True, False
+
+
+async def _handle_microsoft_kmsi(page, idx=0):
+    """Continue through Microsoft's localized Keep Me Signed In prompt."""
+    tag = f"[#{idx}]"
+    try:
+        current_url = (page.url or "").lower()
+    except Exception:
+        current_url = ""
+    try:
+        body = " ".join(
+            (await page.locator("body").inner_text(timeout=3000)).split()
+        ).lower()
+    except Exception:
+        body = ""
+    markers = (
+        "stay signed in", "keep me signed in",
+        "\u8981\u4fdd\u6301\u767b\u5165\u55ce",  # Traditional: keep signed in?
+        "\u4fdd\u6301\u767b\u5165",              # Traditional: keep signed in
+        "\u662f\u5426\u4fdd\u6301\u767b\u5f55",  # Simplified: keep signed in?
+        "\u4fdd\u6301\u767b\u5f55",              # Simplified: keep signed in
+        "rester connecté", "mantener la sesión iniciada",
+        "angemeldet bleiben", "manter-me conectado",
+        "rimanere connessi", "aangemeld blijven",
+        "nie wylogowuj mnie", "оставаться в системе",
+        "oturumunuz açık kalsın",
+        "هل تريد أن يظل دخولك مسجلاً", "هل تريد البقاء قيد تسجيل الدخول",
+        "保持登录状态", "保持登入狀態", "サインインしたままにする",
+        "로그인 상태를 유지",
+    )
+    detected = "/kmsi" in current_url or any(marker in body for marker in markers)
+    if not detected:
+        return False, False
+    clicked = await _click_microsoft_action(
+        page, preferred_ids=("idSIButton9", "acceptButton", "iNext"),
+    )
+    if clicked:
+        print(f"  {tag} [graph] continued past stay-signed-in prompt")
+        await asyncio.sleep(2)
+        return True, True
+    print(f"  {tag} [graph] stay-signed-in prompt detected; action not ready")
+    return True, False
+
+
+async def _extract_graph_token_device(page, email, password, idx=0):
+    """Authorize Graph by device code in the live Microsoft browser session."""
+    tag = f"[#{idx}]"
+    device = await asyncio.to_thread(_request_graph_device_code)
+    if not device:
+        return False
+    verification_uri = _microsoft_url_with_locale(
+        device.get("verification_uri") or "https://www.microsoft.com/link"
+    )
+    try:
+        await page.context.add_init_script("""(() => {
+            try {
+                Object.defineProperty(CredentialsContainer.prototype, 'create', {
+                    configurable: true,
+                    value: () => Promise.reject(
+                        new DOMException('Optional passkey enrollment disabled', 'NotAllowedError')
+                    )
+                });
+            } catch (e) {}
+        })();""")
+    except Exception:
+        pass
+    try:
+        await page.goto(verification_uri, timeout=45000, wait_until="domcontentloaded")
+    except Exception as e:
+        print(f"  {tag} [graph] device page navigation warning: {str(e)[:100]}")
+
+    code_submitted = False
+    idle_rounds = 0
+    for _ in range(30):
+        state, token_data = await asyncio.to_thread(
+            _exchange_graph_device_code, device["device_code"]
+        )
+        if state == "ready":
+            print(f"  {tag} [graph] device authorization OK! refresh_token="
+                  f"{'yes' if token_data.get('refresh_token') else 'no'}")
+            return token_data
+        if state == "failed":
+            error = token_data.get("error_description") or token_data.get("error") or ""
+            print(f"  {tag} [graph] device authorization failed: {str(error)[:150]}")
+            return None
+
+        kmsi_page, kmsi_accepted = await _handle_microsoft_kmsi(page, idx)
+        consent_page = consent_accepted = False
+        if not kmsi_page:
+            consent_page, consent_accepted = await _accept_microsoft_app_consent(
+                page, idx
+            )
+        passkey_page = passkey_skipped = False
+        if not kmsi_page and not consent_page:
+            passkey_page, passkey_skipped = await _skip_optional_passkey(page, idx)
+        recovery_page = recovery_skipped = False
+        if not kmsi_page and not consent_page and not passkey_page:
+            recovery_page, recovery_skipped = await _skip_optional_recovery_email(
+                page, idx
+            )
+        acted = kmsi_accepted or consent_accepted or passkey_skipped or recovery_skipped
+        optional_setup_page = kmsi_page or consent_page or passkey_page or recovery_page
+        if not acted and not optional_setup_page:
+            email_input = page.locator('input[type="email"], input[name="loginfmt"]').first
+            try:
+                if await email_input.count() > 0 and await email_input.is_visible():
+                    await email_input.fill(email)
+                    await page.keyboard.press("Enter")
+                    acted = True
+            except Exception:
+                pass
+
+        if not acted and not optional_setup_page:
+            password_input = page.locator('input[type="password"]').first
+            try:
+                if await password_input.count() > 0 and await password_input.is_visible():
+                    await password_input.fill(password)
+                    await page.keyboard.press("Enter")
+                    acted = True
+            except Exception:
+                pass
+
+        if not acted and not optional_setup_page and not code_submitted:
+            for selector in (
+                'input[name="otc"]', '#otc', 'input[autocomplete="one-time-code"]',
+                'input[placeholder*="code" i]', 'input[type="text"]',
+            ):
+                code_input = page.locator(selector).first
+                try:
+                    if await code_input.count() > 0 and await code_input.is_visible():
+                        await code_input.fill(device["user_code"])
+                        await page.keyboard.press("Enter")
+                        code_submitted = True
+                        acted = True
+                        print(f"  {tag} [graph] device code submitted")
+                        break
+                except Exception:
+                    pass
+
+        if not acted and not optional_setup_page:
+            try:
+                account = page.get_by_text(email, exact=False).first
+                if await account.count() > 0 and await account.is_visible():
+                    await account.click(timeout=3000)
+                    acted = True
+            except Exception:
+                pass
+
+        if not acted and not optional_setup_page:
+            clicked = await _click_microsoft_action(
+                page, preferred_ids=("idSIButton9", "idBtn_Accept", "iNext", "acceptButton"),
+            )
+            acted = bool(clicked)
+
+        idle_rounds = 0 if acted else idle_rounds + 1
+        if idle_rounds >= 3:
+            try:
+                body = " ".join(
+                    (await page.locator("body").inner_text(timeout=3000)).split()
+                )
+            except Exception:
+                body = ""
+            if body:
+                print(f"  {tag} [graph] device page waiting: {body[:180]}")
+            idle_rounds = 0
+        await asyncio.sleep(2)
+    try:
+        body = " ".join(
+            (await page.locator("body").inner_text(timeout=3000)).split()
+        )
+    except Exception:
+        body = ""
+    print(f"  {tag} [graph] device authorization timed out: {body[:180]}")
+    try:
+        os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+        await page.screenshot(
+            path=f"{SCREENSHOT_DIR}/outlook_{idx}_graph_device_timeout.png"
+        )
+    except Exception:
+        pass
+    return None
 
 
 def extract_graph_token_http(email, password, idx=0, attempts=3):
@@ -560,7 +1218,7 @@ def extract_graph_token_http(email, password, idx=0, attempts=3):
     return None
 
 
-async def extract_graph_token(page, context, email, password, idx=0):
+async def _extract_graph_token_authorization_code(page, context, email, password, idx=0):
     """Extract Microsoft Graph API refresh_token after registration.
     Uses OAuth2 authorization code flow with a native client (no secret needed).
     Uses 'consumers' tenant for personal Microsoft accounts (Outlook.com).
@@ -568,7 +1226,6 @@ async def extract_graph_token(page, context, email, password, idx=0):
     """
     tag = f"[#{idx}]"
     try:
-        import urllib.parse
         auth_url = (
             f"https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize"
             f"?client_id={GRAPH_CLIENT_ID}"
@@ -577,8 +1234,15 @@ async def extract_graph_token(page, context, email, password, idx=0):
             f"&scope={urllib.parse.quote(GRAPH_SCOPE)}"
             f"&prompt=consent"
         )
+        auth_url = _microsoft_url_with_locale(auth_url)
         print(f"  {tag} [graph] navigating to OAuth consent...")
-        await page.goto(auth_url, timeout=30000, wait_until="domcontentloaded")
+        try:
+            await page.goto(auth_url, timeout=30000, wait_until="domcontentloaded")
+        except Exception:
+            # A desktop OAuth callback has no local listener. Chromium reports
+            # connection refused while preserving the code in page.url.
+            if "code=" not in page.url and "error=" not in page.url:
+                raise
         await asyncio.sleep(3)
 
         # May need to click accept/consent buttons
@@ -588,43 +1252,52 @@ async def extract_graph_token(page, context, email, password, idx=0):
             if GRAPH_REDIRECT_URI in current_url and "code=" in current_url:
                 break
 
-            # Click accept/yes/consent buttons
-            for sel in [
-                '#idBtn_Accept', 'input[id="idBtn_Accept"]',
-                'button:has-text("Accept")', 'button:has-text("Yes")',
-                'button:has-text("Accepter")', 'button:has-text("同意")',
-                'input[type="submit"][value="Yes"]',
-                'input[type="submit"][value="Accept"]',
-                'input[type="submit"]', 'button[type="submit"]',
-            ]:
-                btn = page.locator(sel).first
-                if await btn.count() > 0:
-                    try:
-                        await btn.click(timeout=3000)
-                        print(f"  {tag} [graph] clicked: {sel}")
-                        await asyncio.sleep(3)
-                        break
-                    except Exception:
-                        pass
-
             # Login if needed (shouldn't be since we just registered)
-            pwd_input = page.locator('input[type="password"]').first
-            if await pwd_input.count() > 0:
-                await pwd_input.fill(password)
-                await page.keyboard.press("Enter")
-                await asyncio.sleep(3)
-
             email_input = page.locator('input[type="email"], input[name="loginfmt"]').first
-            if await email_input.count() > 0:
-                await email_input.fill(email)
-                await page.keyboard.press("Enter")
+            try:
+                if await email_input.count() > 0 and await email_input.is_visible():
+                    await email_input.fill(email)
+                    await page.keyboard.press("Enter")
+                    await asyncio.sleep(3)
+                    continue
+            except Exception:
+                pass
+
+            pwd_input = page.locator('input[type="password"]').first
+            try:
+                if await pwd_input.count() > 0 and await pwd_input.is_visible():
+                    await pwd_input.fill(password)
+                    await page.keyboard.press("Enter")
+                    await asyncio.sleep(3)
+                    continue
+            except Exception:
+                pass
+
+            clicked = await _click_microsoft_action(
+                page, preferred_ids=("idBtn_Accept", "idSIButton9", "acceptButton", "iAgree"),
+            )
+            if clicked:
+                print(f"  {tag} [graph] clicked: {clicked}")
                 await asyncio.sleep(3)
 
             await asyncio.sleep(2)
 
         current_url = page.url
         if "code=" not in current_url:
-            print(f"  {tag} [graph] no auth code in URL: {current_url[:80]}")
+            parsed_error = urllib.parse.parse_qs(
+                urllib.parse.urlparse(current_url).query
+            )
+            oauth_error = parsed_error.get("error_description", [""])[0]
+            if oauth_error:
+                print(f"  {tag} [graph] OAuth error: {oauth_error[:160]}")
+            else:
+                try:
+                    body = " ".join(
+                        (await page.locator("body").inner_text(timeout=3000)).split()
+                    )
+                except Exception:
+                    body = ""
+                print(f"  {tag} [graph] no auth code: {body[:160] or current_url[:120]}")
             await page.screenshot(path=f"{SCREENSHOT_DIR}/outlook_{idx}_graph_fail.png")
             return None
 
@@ -639,17 +1312,21 @@ async def extract_graph_token(page, context, email, password, idx=0):
         print(f"  {tag} [graph] got auth code: {auth_code[:30]}...")
 
         # Exchange code for tokens (consumers tenant for personal accounts)
-        token_resp = requests.post(
-            "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
-            data={
-                "client_id": GRAPH_CLIENT_ID,
-                "grant_type": "authorization_code",
-                "code": auth_code,
-                "redirect_uri": GRAPH_REDIRECT_URI,
-                "scope": GRAPH_SCOPE,
-            },
-            timeout=30,
-        )
+        token_session = _microsoft_direct_session()
+        try:
+            token_resp = token_session.post(
+                "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+                data={
+                    "client_id": GRAPH_CLIENT_ID,
+                    "grant_type": "authorization_code",
+                    "code": auth_code,
+                    "redirect_uri": GRAPH_REDIRECT_URI,
+                    "scope": GRAPH_SCOPE,
+                },
+                timeout=30,
+            )
+        finally:
+            token_session.close()
         token_data = token_resp.json()
 
         if "access_token" in token_data:
@@ -658,6 +1335,7 @@ async def extract_graph_token(page, context, email, password, idx=0):
                 "access_token": token_data["access_token"],
                 "refresh_token": token_data.get("refresh_token"),
                 "expires_in": token_data.get("expires_in"),
+                "client_id": GRAPH_CLIENT_ID,
             }
         else:
             print(f"  {tag} [graph] token error: {token_data.get('error_description', token_data.get('error', '?'))[:100]}")
@@ -666,6 +1344,19 @@ async def extract_graph_token(page, context, email, password, idx=0):
     except Exception as e:
         print(f"  {tag} [graph] error: {e}")
         return None
+
+
+async def extract_graph_token(page, context, email, password, idx=0):
+    """Prefer device-code OAuth; retain authorization-code flow as fallback."""
+    result = await _extract_graph_token_device(page, email, password, idx)
+    if result and result.get("refresh_token"):
+        return result
+    if result is not False:
+        return None
+    print(f"  [#{idx}] [graph] device flow unavailable; trying authorization-code fallback")
+    return await _extract_graph_token_authorization_code(
+        page, context, email, password, idx
+    )
 
 
 # ======================== Outlook Registration ========================
@@ -701,39 +1392,29 @@ async def _maybe_confirm_before_register(page, tag, captcha_early_abort=False):
                                        "資料", "個人資料", "同意並繼續"])
         or any(kw in ptl for kw in ["agree and continue", "consent", "data export",
                                     "accepter et continuer", "consentement",
-                                    "your data", "personal data"])
+                                    "your data", "personal data",
+                                    "aceptar y continuar", "consentimiento", "datos personales",
+                                    "akzeptieren und fortfahren", "einwilligung", "personenbezogene daten",
+                                    "aceitar e continuar", "consentimento", "dados pessoais",
+                                    "accetta e continua", "consenso", "dati personali",
+                                    "accepteren en doorgaan", "toestemming", "persoonsgegevens",
+                                    "zaakceptuj i kontynuuj", "zgoda", "dane osobowe",
+                                    "принять и продолжить", "согласие", "личные данные",
+                                    "kabul et ve devam et", "onay", "kişisel veriler"])
         or "privacynotice" in curl
     )
     if not consent_hit:
         print(f"  {tag} auto-confirm: no data-consent gate, skip (进正常表单)")
         return
 
-    selectors = [
-        'button:has-text("确认")', 'button:has-text("确定")',
-        'button:has-text("同意")', 'button:has-text("接受")',
-        'button:has-text("OK")', 'button:has-text("Ok")',
-        'button:has-text("Confirm")', 'button:has-text("Accept")',
-        'button:has-text("Agree")', 'button:has-text("Agree and continue")',
-        'button:has-text("同意して続行")', 'button:has-text("確認")',
-        'button:has-text("確定")',
-        'input[type="submit"][value*="确认"]', 'input[type="submit"][value*="确定"]',
-        'input[type="submit"][value*="同意"]', 'input[type="submit"][value*="接受"]',
-        'input[type="submit"][value*="OK"]', 'input[type="submit"][value*="Confirm"]',
-        'input[type="submit"][value*="Accept"]', 'input[type="submit"][value*="Agree"]',
-        'a:has-text("确认")', 'a:has-text("确定")', 'a:has-text("同意")',
-        'a:has-text("OK")', 'a:has-text("Confirm")', 'a:has-text("Accept")',
-    ]
     for _ in range(3):
-        for sel in selectors:
-            try:
-                btn = page.locator(sel).first
-                if await btn.count() > 0 and await btn.is_visible(timeout=800):
-                    await btn.click(timeout=3000)
-                    print(f"  {tag} auto-confirm clicked: {sel}")
-                    await asyncio.sleep(2)
-                    return
-            except Exception:
-                pass
+        clicked = await _click_microsoft_action(
+            page, preferred_ids=("acceptButton", "iAgree", "idBtn_Accept", "iNext"),
+        )
+        if clicked:
+            print(f"  {tag} auto-confirm clicked: {clicked}")
+            await asyncio.sleep(2)
+            return
         await asyncio.sleep(1)
     print(f"  {tag} auto-confirm: no confirmation button found")
     return
@@ -753,7 +1434,8 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
 
     try:
         print(f"  {tag} navigating to signup page...")
-        await page.goto("https://signup.live.com/signup?lic=1", timeout=60000, wait_until="domcontentloaded")
+        signup_url = _microsoft_url_with_locale("https://signup.live.com/signup?lic=1")
+        await page.goto(signup_url, timeout=60000, wait_until="domcontentloaded")
         await asyncio.sleep(3)
         await page.screenshot(path=f"{SCREENSHOT_DIR}/outlook_{idx}_start.png")
         await _maybe_confirm_before_register(page, tag, captcha_early_abort)
@@ -769,46 +1451,21 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
                 any(kw in page_text for kw in ["同意并继续", "个人数据", "数据导出"]) or \
                 any(kw in page_text.lower() for kw in [
                     "agree and continue", "consent", "data export",
-                    "accepter et continuer", "consentement",
+                    "accepter et continuer", "consentement", "aceptar y continuar",
+                    "akzeptieren und fortfahren", "aceitar e continuar",
+                    "accetta e continua", "accepteren en doorgaan",
+                    "zaakceptuj i kontynuuj", "принять и продолжить",
+                    "kabul et ve devam et",
                 ]) or "privacynotice" in current_url
             ):
                 print(f"  {tag} privacy/consent page detected, clicking accept...")
-                clicked = False
-                # Try various accept buttons
-                for sel in [
-                    'button:has-text("同意并继续")', 'input[value="同意并继续"]',
-                    'button:has-text("同意")', 'a:has-text("同意并继续")',
-                    'button:has-text("Agree and continue")', 'button:has-text("Accept")',
-                    'button:has-text("Continue")', 'button:has-text("OK")',
-                    'button:has-text("Accepter et continuer")', 'button:has-text("Accepter")',
-                    'button:has-text("Continuer")', 'button:has-text("Suivant")',
-                    'input[type="submit"]', 'button[type="submit"]',
-                    '#iNext', '#iAgree', '#acceptButton',
-                ]:
-                    btn = page.locator(sel).first
-                    if await btn.count() > 0:
-                        try:
-                            await btn.click(timeout=5000)
-                            print(f"  {tag} clicked consent: {sel}")
-                            clicked = True
-                            break
-                        except Exception:
-                            pass
-                if not clicked:
-                    # Fallback: click any visible button
-                    try:
-                        await page.evaluate("""() => {
-                            const btns = document.querySelectorAll('button, input[type="submit"], a.btn');
-                            for (const b of btns) {
-                                if (b.offsetParent !== null && b.textContent.length < 30) {
-                                    b.click(); return true;
-                                }
-                            }
-                            return false;
-                        }""")
-                        print(f"  {tag} JS-clicked consent button")
-                    except Exception:
-                        pass
+                clicked = await _click_microsoft_action(
+                    page, preferred_ids=("acceptButton", "iAgree", "idBtn_Accept", "iNext"),
+                )
+                if clicked:
+                    print(f"  {tag} clicked consent: {clicked}")
+                else:
+                    print(f"  {tag} consent action not ready")
                 await asyncio.sleep(3)
                 await page.screenshot(path=f"{SCREENSHOT_DIR}/outlook_{idx}_after_consent_{_consent_try}.png")
             else:
@@ -858,8 +1515,9 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
 
             page_text = await page.evaluate("() => document.body.innerText")
             page_lower = page_text.lower()
+            rejection = await _signup_email_rejected(page, email_input)
 
-            if ("already" in page_lower and "email" in page_lower) or "taken" in page_lower:
+            if rejection == "taken" or ("already" in page_lower and "email" in page_lower) or "taken" in page_lower:
                 prefix = random.choice(string.ascii_lowercase) + "".join(
                     random.choices(string.ascii_lowercase + string.digits, k=11)
                 )
@@ -867,7 +1525,7 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
                 print(f"  {tag} email taken, retry: {email}")
                 continue
 
-            if "needs to start" in page_lower or "in the format" in page_lower or "enter a valid" in page_lower or "use letters" in page_lower:
+            if rejection == "format" or "needs to start" in page_lower or "in the format" in page_lower or "enter a valid" in page_lower or "use letters" in page_lower:
                 prefix = random.choice(string.ascii_lowercase) + "".join(
                     random.choices(string.ascii_lowercase + string.digits, k=9)
                 )
@@ -902,18 +1560,9 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
             print(f"  {tag} password filled")
             await asyncio.sleep(0.5)
 
-            clicked_next = False
-            for sel in ['#iSignupAction', 'input[type="submit"]', 'button[type="submit"]',
-                        'button:has-text("Next")', 'button:has-text("next")',
-                        'button:has-text("下一步")', 'button:has-text("Suivant")']:
-                btn = page.locator(sel).first
-                if await btn.count() > 0:
-                    try:
-                        await btn.click(timeout=3000)
-                        clicked_next = True
-                        break
-                    except Exception:
-                        pass
+            clicked_next = await _click_microsoft_action(
+                page, preferred_ids=("iSignupAction", "iNext", "idSIButton9"),
+            )
             if not clicked_next:
                 await page.keyboard.press("Enter")
 
@@ -927,13 +1576,13 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
         year, month, day = generate_birthday()
         await asyncio.sleep(2)
 
-        # Wait for birthday page to load (CN/EN/FR)
+        # Wait for the structural birth-date controls; labels vary by exit locale.
         for _ in range(10):
-            page_text = await page.evaluate("() => document.body.innerText")
-            if any(kw in page_text.lower() for kw in [
-                "birth", "country", "region",
-                "naissance", "pays", "région", "détails",
-            ]) or any(kw in page_text for kw in ["出生", "国家", "地区", "年份", "详细信息"]):
+            birth_controls = page.locator(
+                '[id*="Birth" i], [name*="Birth" i], '
+                + 'select, [role="combobox"], input[type="number"]'
+            )
+            if await birth_controls.count() >= 2:
                 break
             await asyncio.sleep(1)
 
@@ -957,40 +1606,39 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
         print(f"  {tag} found {select_count} select elements")
 
         if select_count >= 2:
-            # Traditional <select> dropdowns
-            if select_count >= 3:
-                try:
-                    await all_selects.nth(0).select_option("US")
-                    print(f"  {tag} country: US")
-                except Exception:
+            # Traditional <select> dropdowns, classified by stable metadata.
+            for select_index in range(select_count):
+                select = all_selects.nth(select_index)
+                metadata = {
+                    "id": await select.get_attribute("id") or "",
+                    "name": await select.get_attribute("name") or "",
+                    "ariaLabel": await select.get_attribute("aria-label") or "",
+                    "text": (await select.text_content() or "")[:80],
+                }
+                kind = _birthdate_field_kind(metadata)
+                if not kind:
+                    inferred = ("country", "month", "day") if select_count >= 3 else ("month", "day")
+                    kind = inferred[select_index] if select_index < len(inferred) else ""
+                if kind == "country":
                     try:
-                        await all_selects.nth(0).select_option(index=1)
+                        await select.select_option("US")
+                        print(f"  {tag} country: US")
                     except Exception:
                         pass
-                await all_selects.nth(1).select_option(str(month))
-                await all_selects.nth(2).select_option(str(day))
-            else:
-                await all_selects.nth(0).select_option(str(month))
-                await all_selects.nth(1).select_option(str(day))
+                elif kind == "month":
+                    await _select_native_numeric_option(select, month)
+                elif kind == "day":
+                    await _select_native_numeric_option(select, day)
 
             year_input = page.locator(
-                'input[id*="Year"], input[id*="year"], input[name*="Year"], '
-                'input[name*="year"], input[type="text"]'
+                'input[id*="BirthYear" i], input[name*="BirthYear" i], '
+                'input[id*="Year" i], input[name*="Year" i], input[type="number"]'
             ).first
             if await year_input.count() > 0:
                 await year_input.fill(str(year))
         else:
-            # New UI with combobox/dropdown (Chinese or English)
+            # New UI with combobox/dropdown.
             print(f"  {tag} no <select>, trying new UI (combobox)...")
-
-            month_names_en = ["", "January", "February", "March", "April", "May", "June",
-                              "July", "August", "September", "October", "November", "December"]
-            # Chinese month names: 1月, 2月, ... 12月
-            month_names_cn = ["", "1月", "2月", "3月", "4月", "5月", "6月",
-                              "7月", "8月", "9月", "10月", "11月", "12月"]
-            # French month names
-            month_names_fr = ["", "janvier", "février", "mars", "avril", "mai", "juin",
-                              "juillet", "août", "septembre", "octobre", "novembre", "décembre"]
 
             # Find all visible comboboxes
             combos = page.locator('button[role="combobox"], [role="combobox"]')
@@ -1011,85 +1659,27 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
                     combo_text = (await combo.text_content() or "").strip()
                     combo_label = (await combo.get_attribute("aria-label") or "").lower()
                     combo_id = (await combo.get_attribute("id") or "").lower()
+                    combo_name = (await combo.get_attribute("name") or "").lower()
+                    combo_placeholder = (await combo.get_attribute("placeholder") or "").lower()
                     info = f"text='{combo_text}' label='{combo_label}' id='{combo_id}'"
                     print(f"  {tag} combo[{ci}]: {info}")
 
-                    # Multi-language detection: EN/CN/FR/ES/DE/PT
-                    is_month = any(kw in combo_label for kw in ["month", "月", "mois", "mes", "monat", "mês"]) or \
-                               any(kw in combo_id for kw in ["month", "birthmonth"]) or \
-                               combo_text in ["月", "Month", "月份", "Mois", "Mes"]
-                    is_day = any(kw in combo_label for kw in ["day", "日", "jour", "día", "tag", "dia"]) or \
-                             any(kw in combo_id for kw in ["day", "birthday"]) or \
-                             combo_text in ["日", "Day", "Jour", "Día"]
+                    kind = _birthdate_field_kind({
+                        "id": combo_id, "name": combo_name, "ariaLabel": combo_label,
+                        "placeholder": combo_placeholder, "text": combo_text,
+                    })
+                    if not kind:
+                        inferred = ("country", "month", "day") if combo_count >= 3 else ("month", "day")
+                        kind = inferred[ci] if ci < len(inferred) else ""
 
-                    # Disambiguate: if id contains both "day" and "month" substrings, use the more specific match
-                    if is_month and is_day:
-                        # Prefer the specific keyword: "birthdaydropdown" → day, "birthmonthdropdown" → month
-                        if "month" in combo_id:
-                            is_day = False
-                        elif "day" in combo_id:
-                            is_month = False
-
-                    # If text contains "月" or "日" at end, it's already showing a value
-                    if not is_month and not is_day:
-                        if combo_text.endswith("月") and len(combo_text) <= 3:
-                            is_month = True
-                        elif combo_text.endswith("日") and len(combo_text) <= 4:
-                            is_day = True
-
-                    if is_month and not month_filled:
-                        await combo.click(force=True)
-                        await asyncio.sleep(1)
-                        # Try month option (Chinese → English → French → number)
-                        month_opt = page.locator(f'[role="option"]:has-text("{month_names_cn[month]}")').first
-                        if await month_opt.count() == 0:
-                            month_opt = page.locator(f'[role="option"]:has-text("{month_names_en[month]}")').first
-                        if await month_opt.count() == 0:
-                            month_opt = page.locator(f'[role="option"]:has-text("{month_names_fr[month]}")').first
-                        if await month_opt.count() == 0:
-                            month_opt = page.locator(f'[role="option"]:has-text("{month}")').first
-                        if await month_opt.count() > 0:
-                            await month_opt.click()
-                            month_filled = True
-                            print(f"  {tag} month: {month}")
-                        else:
-                            await page.keyboard.type(str(month))
-                            await asyncio.sleep(0.3)
-                            await page.keyboard.press("Enter")
-                            month_filled = True
-                        await asyncio.sleep(1)
-
-                    elif is_day and not day_filled:
-                        await combo.click(force=True)
-                        await asyncio.sleep(1)
-                        # Try day option: exact match first to avoid "1" matching "10","11"...
-                        day_str = str(day)
-                        # Try exact match via all options
-                        day_opt = None
-                        try:
-                            all_opts = page.locator('[role="option"]')
-                            opt_count = await all_opts.count()
-                            for oi in range(opt_count):
-                                opt_text = (await all_opts.nth(oi).text_content() or "").strip()
-                                if opt_text == day_str or opt_text == f"{day}日":
-                                    day_opt = all_opts.nth(oi)
-                                    break
-                        except Exception:
-                            pass
-                        if not day_opt:
-                            day_opt = page.locator(f'[role="option"]:has-text("{day}日")').first
-                        if not day_opt or await day_opt.count() == 0:
-                            day_opt = page.locator(f'[role="option"]:has-text("{day_str}")').first
-                        if await day_opt.count() > 0:
-                            await day_opt.click()
-                            day_filled = True
-                            print(f"  {tag} day: {day}")
-                        else:
-                            await page.keyboard.type(str(day))
-                            await asyncio.sleep(0.3)
-                            await page.keyboard.press("Enter")
-                            day_filled = True
-                        await asyncio.sleep(1)
+                    if kind == "month" and not month_filled:
+                        await _select_birthdate_combo_option(page, combo, month)
+                        month_filled = True
+                        print(f"  {tag} month: {month}")
+                    elif kind == "day" and not day_filled:
+                        await _select_birthdate_combo_option(page, combo, day)
+                        day_filled = True
+                        print(f"  {tag} day: {day}")
                 except Exception as e:
                     print(f"  {tag} combo[{ci}] error: {e}")
 
@@ -1116,40 +1706,29 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
                 print(f"  {tag} year: {year}")
 
         await asyncio.sleep(0.5)
-        for sel in ['input[type="submit"]', 'button[type="submit"]', '#iSignupAction',
-                    'button[id="iSignupAction"]', 'button:has-text("下一步")',
-                    'button:has-text("Next")', 'button:has-text("next")',
-                    'button:has-text("Suivant")']:
-            btn = page.locator(sel).first
-            if await btn.count() > 0:
-                await btn.click(timeout=3000)
-                print(f"  {tag} clicked next (bday): {sel}")
-                break
+        clicked = await _click_microsoft_action(
+            page, preferred_ids=("iSignupAction", "iNext", "idSIButton9"),
+        )
+        if clicked:
+            print(f"  {tag} clicked next (bday): {clicked}")
         await asyncio.sleep(3)
         await page.screenshot(path=f"{SCREENSHOT_DIR}/outlook_{idx}_after_bday.png")
 
-        # Step 4: Username/Gamertag (Chinese: 游戏标签/用户名)
+        # Step 4: Optional Username/Gamertag. Stable field attributes are locale-free.
         await asyncio.sleep(2)
         username_input = page.locator(
-            'input[id*="displayName"], input[id*="gamertag"], input[name*="displayName"], '
-            'input[placeholder*="name"], input[type="text"]'
+            'input[id*="displayName" i], input[id*="gamertag" i], '
+            'input[name*="displayName" i], input[name*="gamertag" i]'
         ).first
         if await username_input.count() > 0:
-            page_text = await page.evaluate("() => document.body.innerText")
-            if any(kw in page_text.lower() for kw in ["name", "gamertag", "nom", "pseudo", "surnom"]) or \
-               any(kw in page_text for kw in ["用户名", "游戏标签", "显示名称"]):
-                username = prefix[:8] + str(random.randint(100, 999))
-                await username_input.fill(username)
-                print(f"  {tag} username: {username}")
-                await asyncio.sleep(0.5)
-                for sel in ['input[type="submit"]', 'button[type="submit"]', '#iSignupAction',
-                            'button:has-text("下一步")', 'button:has-text("Next")',
-                            'button:has-text("Suivant")']:
-                    btn = page.locator(sel).first
-                    if await btn.count() > 0:
-                        await btn.click(timeout=3000)
-                        break
-                await asyncio.sleep(3)
+            username = prefix[:8] + str(random.randint(100, 999))
+            await username_input.fill(username)
+            print(f"  {tag} username: {username}")
+            await asyncio.sleep(0.5)
+            await _click_microsoft_action(
+                page, preferred_ids=("iSignupAction", "iNext", "idSIButton9"),
+            )
+            await asyncio.sleep(3)
 
         # Step 5: First/Last Name + checkbox (Chinese: 姓/名)
         first_name, last_name = generate_name()
@@ -1160,13 +1739,19 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
                 'input[name="FirstName"], input[id="FirstName"], input[name="firstNameInput"], '
                 'input[id="firstNameInput"], input[aria-label*="first" i], input[placeholder*="first" i], '
                 'input[aria-label*="名" i], input[placeholder*="名" i], '
-                'input[aria-label*="prénom" i], input[placeholder*="prénom" i]'
+                'input[aria-label*="prénom" i], input[placeholder*="prénom" i], '
+                'input[aria-label*="nombre" i], input[placeholder*="nombre" i], '
+                'input[aria-label*="vorname" i], input[placeholder*="vorname" i], '
+                'input[aria-label*="nome" i], input[placeholder*="nome" i]'
             ).first
             lname_input = page.locator(
                 'input[name="LastName"], input[id="LastName"], input[name="lastNameInput"], '
                 'input[id="lastNameInput"], input[aria-label*="last" i], input[aria-label*="surname" i], '
                 'input[placeholder*="last" i], input[aria-label*="姓" i], input[placeholder*="姓" i], '
-                'input[aria-label*="nom de famille" i], input[placeholder*="nom de famille" i]'
+                'input[aria-label*="nom de famille" i], input[placeholder*="nom de famille" i], '
+                'input[aria-label*="apellido" i], input[placeholder*="apellido" i], '
+                'input[aria-label*="nachname" i], input[placeholder*="nachname" i], '
+                'input[aria-label*="cognome" i], input[placeholder*="cognome" i]'
             ).first
             if await fname_input.count() > 0 or await lname_input.count() > 0:
                 break
@@ -1199,14 +1784,11 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
                 print(f"  {tag} checkbox checked")
 
         await asyncio.sleep(0.5)
-        for sel in ['input[type="submit"]', 'button[type="submit"]', '#iSignupAction',
-                    'button[id="iSignupAction"]', 'button:has-text("Next")',
-                    'button:has-text("下一步")', 'button:has-text("Suivant")']:
-            btn = page.locator(sel).first
-            if await btn.count() > 0:
-                await btn.click(timeout=3000)
-                print(f"  {tag} clicked next (name): {sel}")
-                break
+        clicked = await _click_microsoft_action(
+            page, preferred_ids=("iSignupAction", "iNext", "idSIButton9"),
+        )
+        if clicked:
+            print(f"  {tag} clicked next (name): {clicked}")
         await asyncio.sleep(3)
         await page.screenshot(path=f"{SCREENSHOT_DIR}/outlook_{idx}_after_name.png")
 
@@ -1320,11 +1902,19 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
                     await asyncio.sleep(3)
                     continue
 
-            # Account blocked detection (CN/EN/FR)
+            # Account blocked detection across common Microsoft markets.
             if any(kw in page_text for kw in [
                 "帐户创建已被阻止", "已被阻止", "阻止创建",
                 "account creation has been blocked", "has been blocked", "account has been suspended",
                 "création de compte a été bloquée", "a été bloquée", "bloquée",
+                "creación de la cuenta se ha bloqueado", "cuenta bloqueada",
+                "kontoerstellung wurde blockiert", "konto wurde gesperrt",
+                "criação da conta foi bloqueada", "conta bloqueada",
+                "creazione dell'account è stata bloccata", "account bloccato",
+                "account maken is geblokkeerd", "account geblokkeerd",
+                "tworzenie konta zostało zablokowane", "konto zablokowane",
+                "создание учетной записи заблокировано", "учетная запись заблокирована",
+                "hesap oluşturma engellendi", "hesap engellendi",
                 "unusual activity", "异常活动", "activité inhabituelle",
             ]):
                 print(f"  {tag} BLOCKED: account creation blocked by Microsoft")
@@ -1333,39 +1923,16 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
 
             # FIDO/passkey - skip
             if "fido" in current_url or "passkey" in current_url:
-                for sel in ['a:has-text("Skip")', 'button:has-text("Skip")', 'a:has-text("No thanks")',
-                            'button:has-text("No thanks")', 'button:has-text("Cancel")', '#skipBtn']:
-                    btn = page.locator(sel).first
-                    if await btn.count() > 0:
-                        try:
-                            await btn.click(timeout=3000)
-                            break
-                        except Exception:
-                            pass
-                else:
-                    try:
-                        await page.evaluate("""() => {
-                            for (const l of document.querySelectorAll('a, button')) {
-                                const t = l.textContent.toLowerCase();
-                                if (t.includes('skip') || t.includes('no thanks') || t.includes('cancel')) { l.click(); return; }
-                            }
-                        }""")
-                    except Exception:
-                        pass
+                await _skip_optional_passkey(page, idx)
                 await asyncio.sleep(3)
                 continue
 
             # Privacy notice
             if "privacynotice" in current_url:
                 await asyncio.sleep(2)
-                for label in ['OK', 'Accept', 'Continue', 'Next', 'I agree', 'Got it']:
-                    btn = page.locator(f'button:has-text("{label}"), input[value="{label}"], a:has-text("{label}")').first
-                    if await btn.count() > 0:
-                        try:
-                            await btn.click(timeout=3000)
-                            break
-                        except Exception:
-                            pass
+                await _click_microsoft_action(
+                    page, preferred_ids=("acceptButton", "iAgree", "iNext", "idSIButton9"),
+                )
                 await asyncio.sleep(3)
                 continue
 
@@ -1553,14 +2120,9 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
             on_signup_form = ("signup.live.com" in current_url) and ("privacynotice" not in current_url)
             if not on_signup_form and "privacynotice" not in current_url:
                 break
-            for label in ['OK', 'Accept', 'Continue', 'Next', 'I agree', 'Got it', 'Agree']:
-                btn = page.locator(f'button:has-text("{label}"), input[value="{label}"], a:has-text("{label}")').first
-                if await btn.count() > 0:
-                    try:
-                        await btn.click(timeout=3000)
-                        break
-                    except Exception:
-                        pass
+            await _click_microsoft_action(
+                page, preferred_ids=("acceptButton", "iAgree", "iNext", "idSIButton9"),
+            )
             await asyncio.sleep(3)
 
         if not verify_registered_outlook(email, password, tag):
@@ -1622,15 +2184,16 @@ def register_outlook_protocol(proxy_str=None, idx=0):
             "Chrome/130.0.0.0 Safari/537.36"
         ),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Language": f"{MICROSOFT_UI_LOCALE},en;q=0.8",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
     })
 
     try:
         print(f"  {tag} GET signup page...")
+        signup_url = _microsoft_url_with_locale("https://signup.live.com/signup?lic=1")
         resp = session.get(
-            "https://signup.live.com/signup?lic=1",
+            signup_url,
             proxies=proxies, timeout=30, allow_redirects=True,
         )
         if resp.status_code != 200:
@@ -1670,7 +2233,7 @@ def register_outlook_protocol(proxy_str=None, idx=0):
         uaid_m = re.search(r'[?&]uaid=([A-Za-z0-9\-]+)', html)
         uaid = uaid_m.group(1) if uaid_m else ""
         action_m = re.search(r'action="(https://signup\.live\.com[^"]+)"', html)
-        action_url = action_m.group(1) if action_m else f"https://signup.live.com/signup?lic=1&uaid={uaid}"
+        action_url = action_m.group(1) if action_m else f"{signup_url}&uaid={uaid}"
 
         # Extract canary token (CSRF #2, optional)
         canary_name_m = re.search(r'"sCanaryTokenName"\s*:\s*"([^"]+)"', html)
@@ -1708,7 +2271,7 @@ def register_outlook_protocol(proxy_str=None, idx=0):
             data=form_data,
             headers={
                 "Content-Type": "application/x-www-form-urlencoded",
-                "Referer": "https://signup.live.com/signup?lic=1",
+                "Referer": signup_url,
                 "Origin": "https://signup.live.com",
             },
             proxies=proxies, timeout=30, allow_redirects=True,
@@ -2007,6 +2570,48 @@ async def _register_one_browser(bb, idx, proxy_str):
                 pass
 
 
+async def extract_graph_token_browser(bb, email, password, idx=0, proxy_str=None):
+    """Authorize Graph in a disposable BitBrowser profile via Device Code."""
+    tag = f"[#{idx}][graph-browser]"
+    profile_id = None
+    try:
+        name = f"outlook_graph_{datetime.now().strftime('%m%d_%H%M%S')}_{idx}"
+        for attempt in range(3):
+            try:
+                profile_id = bb.create_browser(name=name, proxy_str=proxy_str)
+                break
+            except Exception as e:
+                if attempt >= 2:
+                    raise
+                print(f"  {tag} create retry {attempt + 1}/3: {str(e)[:80]}")
+                await asyncio.sleep(3 + attempt)
+        if not profile_id:
+            return None
+
+        info = bb.open_browser(profile_id)
+        ws = info.get("ws", "")
+        if not ws:
+            print(f"  {tag} no WebSocket URL")
+            return None
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(ws)
+            context = browser.contexts[0] if browser.contexts else await browser.new_context()
+            page = context.pages[0] if context.pages else await context.new_page()
+            return await extract_graph_token(page, context, email, password, idx)
+    except Exception as e:
+        print(f"  {tag} error: {str(e)[:140]}")
+        return None
+    finally:
+        if profile_id:
+            try:
+                bb.close_browser(profile_id)
+                await asyncio.sleep(2)
+                bb.delete_browser(profile_id)
+                print(f"  {tag} browser cleaned up")
+            except Exception:
+                pass
+
+
 # ======================== Main ========================
 
 async def register_one(bb, idx, proxy_str, results, results_lock, live_fh=None, mode="auto"):
@@ -2065,11 +2670,16 @@ async def register_one(bb, idx, proxy_str, results, results_lock, live_fh=None, 
 
     graph = None
     if email:
-        print(f"  {tag} [graph] extracting refresh_token...")
-        loop = asyncio.get_event_loop()
-        graph = await loop.run_in_executor(
-            None, extract_graph_token_http, email, password, idx
+        print(f"  {tag} [graph] extracting refresh_token via Device Code...")
+        graph = await extract_graph_token_browser(
+            bb, email, password, idx, proxy_str
         )
+        if not graph or not graph.get("refresh_token"):
+            print(f"  {tag} [graph] browser authorization failed; trying HTTP fallback")
+            loop = asyncio.get_event_loop()
+            graph = await loop.run_in_executor(
+                None, extract_graph_token_http, email, password, idx
+            )
 
     # ── Save result ───────────────────────────────────────────────
     async with results_lock:

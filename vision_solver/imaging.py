@@ -196,6 +196,127 @@ def overlay_grid_numbers(image_b64, path, rows, cols,
         return image_b64, None
 
 
+def detect_shortest_bead_chain_cells(image_b64, geom, count=2):
+    """Map the shortest bright bead chains in a dark canvas to grid click cells."""
+    try:
+        import io
+        import math
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
+        boxes = list((geom or {}).get("boxes") or [])
+        centers = list((geom or {}).get("cells_xy") or [])
+        if not boxes or len(boxes) != len(centers):
+            return []
+
+        left = max(0, min(box[0] for box in boxes))
+        top = max(0, min(box[1] for box in boxes))
+        right = min(image.width, max(box[0] + box[2] for box in boxes))
+        bottom = min(image.height, max(box[1] + box[3] for box in boxes))
+        grid_area = max(1, (right - left) * (bottom - top))
+
+        brightness = []
+        for y in range(top, bottom):
+            for x in range(left, right):
+                brightness.append(max(image.getpixel((x, y))))
+        brightness.sort()
+        background_high = brightness[int(len(brightness) * 0.80)]
+        bright_floor = max(135, min(190, background_high + 30))
+
+        mask = set()
+        for y in range(top, bottom):
+            for x in range(left, right):
+                red, green, blue = image.getpixel((x, y))
+                if (
+                    max(red, green, blue) >= bright_floor
+                    and max(red, green, blue) - min(red, green, blue) >= 16
+                ):
+                    mask.add((x, y))
+
+        min_component_area = max(12, int(grid_area * 0.00035))
+        max_component_area = max(min_component_area + 1, int(grid_area * 0.004))
+        beads = []
+        while mask:
+            seed = mask.pop()
+            queue = [seed]
+            pixels = [seed]
+            for px, py in queue:
+                for neighbor in (
+                    (px + 1, py), (px - 1, py),
+                    (px, py + 1), (px, py - 1),
+                ):
+                    if neighbor in mask:
+                        mask.remove(neighbor)
+                        queue.append(neighbor)
+                        pixels.append(neighbor)
+            size = len(pixels)
+            if not min_component_area <= size <= max_component_area:
+                continue
+            xs = [pixel[0] for pixel in pixels]
+            ys = [pixel[1] for pixel in pixels]
+            width = max(xs) - min(xs) + 1
+            height = max(ys) - min(ys) + 1
+            if max(width, height) > 2.2 * max(1, min(width, height)):
+                continue
+            if size / max(1, width * height) < 0.25:
+                continue
+            beads.append({
+                "x": sum(xs) / size,
+                "y": sum(ys) / size,
+                "diameter": max(width, height),
+            })
+
+        if len(beads) < count * 3:
+            return []
+        diameters = sorted(bead["diameter"] for bead in beads)
+        median_diameter = diameters[len(diameters) // 2]
+        link_distance = max(8.0, median_diameter * 1.7)
+
+        remaining = set(range(len(beads)))
+        chains = []
+        while remaining:
+            seed = remaining.pop()
+            queue = [seed]
+            chain = [seed]
+            for current in queue:
+                linked = []
+                for candidate in remaining:
+                    distance = math.hypot(
+                        beads[current]["x"] - beads[candidate]["x"],
+                        beads[current]["y"] - beads[candidate]["y"],
+                    )
+                    if distance <= link_distance:
+                        linked.append(candidate)
+                for candidate in linked:
+                    remaining.remove(candidate)
+                    queue.append(candidate)
+                    chain.append(candidate)
+            if len(chain) >= 3:
+                chains.append(chain)
+
+        if len(chains) < count:
+            return []
+        selected = sorted(chains, key=len)[:count]
+        picked = []
+        for chain in selected:
+            candidates = []
+            for cell_index, (cx, cy) in enumerate(centers):
+                if cell_index in picked:
+                    continue
+                distance = min(
+                    math.hypot(cx - beads[index]["x"], cy - beads[index]["y"])
+                    for index in chain
+                )
+                candidates.append((distance, cell_index))
+            if not candidates:
+                return []
+            picked.append(min(candidates)[1])
+        return sorted(picked)
+    except Exception as error:
+        print(f"  [img] bead-chain detection err: {str(error)[:60]}")
+        return []
+
+
 def annotate_canvas_choice(grid_path, geom, picked, out_path, note="", votes_raw=None):
     """canvas_grid 复盘：在已编号网格图上，粗红框标最终选择 + 各模型投票彩框。
     geom 用 overlay_grid_numbers 的 boxes 字段。"""

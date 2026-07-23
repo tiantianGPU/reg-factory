@@ -10,12 +10,14 @@ vision_solver/drivers.py — 通用求解 driver
 """
 
 import asyncio
+import math
 import os
+import random
 
 from .vision import vote_answer, vote_picklist, vote_points
 from .imaging import (
     shot_element, screenshot_frame_region, stitch_options_grid, enhance_local, annotate_choice,
-    overlay_grid_numbers, annotate_canvas_choice,
+    overlay_grid_numbers, annotate_canvas_choice, detect_shortest_bead_chain_cells,
 )
 from .schema import build_prompt
 
@@ -24,11 +26,23 @@ async def _find_frame(page, frame_match):
     """按 url 关键字找承载挑战的 frame；frame_match 空则返回 main_frame。"""
     if not frame_match:
         return page.main_frame
+    matches = []
     for f in page.frames:
         u = (f.url or "").lower()
         if any(k.lower() in u for k in frame_match):
-            return f
-    return None
+            matches.append(f)
+    # hCaptcha may retain hidden preload challenge frames. Prefer the matching
+    # frame whose canvas is actually laid out, then preserve the old first-match
+    # behavior for non-canvas challenge drivers.
+    for f in matches:
+        try:
+            canvas = f.locator("canvas").first
+            box = await canvas.bounding_box() if await canvas.count() else None
+            if box and box.get("width", 0) > 100 and box.get("height", 0) > 100:
+                return f
+        except Exception:
+            pass
+    return matches[0] if matches else None
 
 
 async def _challenge_present(page, frame_match, markers):
@@ -81,10 +95,31 @@ async def solve_grid_select(page, spec, shot_dir):
             geom = None
         elif n_tiles > 0:
             cells = []
+            capture_failed = False
             for i in range(n_tiles):
-                c = await shot_element(frame, f"({spec.tile_sel}) >> nth={i}", f"{shot_dir}/t_r{rnd}_{i}.png", scale=2)
+                c = None
+                for capture_attempt in range(3):
+                    c = await shot_element(
+                        frame,
+                        f"{spec.tile_sel} >> nth={i}",
+                        f"{shot_dir}/t_r{rnd}_{i}.png",
+                        scale=2,
+                    )
+                    if c:
+                        break
+                    await asyncio.sleep(0.4)
                 if c:
                     cells.append(c)
+                else:
+                    capture_failed = True
+                    break
+            if capture_failed or len(cells) != n_tiles:
+                print(
+                    f"  [grid] R{rnd} tile DOM changed during capture; "
+                    "retrying without submitting"
+                )
+                await asyncio.sleep(1)
+                continue
             img, geom = stitch_options_grid(cells, f"{shot_dir}/grid_r{rnd}.png", cols=spec.cols, return_geom=True)
         else:
             print(f"  [grid] R{rnd} 无 tile/grid 选择器，无法截图")
@@ -96,7 +131,22 @@ async def solve_grid_select(page, spec, shot_dir):
 
         n_opt = n_tiles if n_tiles > 0 else 9   # 整图模式默认按 3x3=9 编号
         prompt = build_prompt(spec, instruction, n_opt)
-        picks, votes, raws = vote_picklist(prompt, img_hd, n_opt, deadline=spec.deadline)
+        picks, votes, raws = [], {}, []
+        for vote_attempt in range(1, 4):
+            picks, votes, raws = vote_picklist(
+                prompt, img_hd, n_opt, deadline=spec.deadline
+            )
+            if any(raw[1] is not None for raw in raws):
+                break
+            if vote_attempt < 3:
+                print(
+                    f"  [grid] R{rnd} model response was unavailable or malformed; "
+                    f"retrying current challenge ({vote_attempt + 1}/3)"
+                )
+                await asyncio.sleep(vote_attempt)
+        if not any(raw[1] is not None for raw in raws):
+            print(f"  [grid] R{rnd} no parseable model response; leaving challenge intact")
+            return False
         print(f"  [grid] R{rnd} instruction={instruction[:50]!r} -> PICK {picks} votes={votes}")
         try:
             annotate_choice(f"{shot_dir}/grid_r{rnd}.png", geom, picks,
@@ -360,7 +410,39 @@ async def solve_canvas_grid(page, spec, shot_dir):
         grid_hd = enhance_local(grid_b64, f"{shot_dir}/hc_r{rnd}_hd.png", scale=1)
 
         prompt = build_prompt(spec, instruction, n_opt)
-        if single:
+        local_picks = []
+        if spec.answer_format == "SHORTEST_BEAD_CHAINS":
+            local_picks = detect_shortest_bead_chain_cells(img, geom, count=2)
+        direct_clicks = []
+        if spec.answer_format == "TWO_POINTS":
+            point_image = enhance_local(
+                img, f"{shot_dir}/hc_r{rnd}_points.jpg", scale=1
+            )
+            first, second, raws = vote_points(
+                prompt,
+                point_image,
+                max_tokens=spec.answer_max_tokens,
+                deadline=spec.deadline,
+            )
+            if not first or not second:
+                print(f"  [canvas] R{rnd} no valid two-point vision answer")
+                return False
+            direct_clicks = [
+                (first[0] * canvas_w, first[1] * canvas_h),
+                (second[0] * canvas_w, second[1] * canvas_h),
+            ]
+            picks = []
+            votes = {}
+            print(
+                f"  [canvas] R{rnd} direct click points -> "
+                f"{first}, {second}"
+            )
+        elif local_picks:
+            picks = local_picks
+            votes = {index: 1 for index in picks}
+            raws = [("bead-chain-detector", picks, "local image analysis")]
+            print(f"  [canvas] R{rnd} local shortest-chain detection -> {picks}")
+        elif single:
             # 单答案：vote_answer 取多数票（平票按模型顺序），永不空选
             best, votes, raws = vote_answer(prompt, grid_hd, n_opt, deadline=spec.deadline)
             if best is None:
@@ -376,7 +458,13 @@ async def solve_canvas_grid(page, spec, shot_dir):
                 print(f"  [canvas] R{rnd} 单选无 ANSWER，兜底点 #{best}")
             picks = [best]
         else:
-            picks, votes, raws = vote_picklist(prompt, grid_hd, n_opt, deadline=spec.deadline)
+            picks, votes, raws = vote_picklist(
+                prompt,
+                grid_hd,
+                n_opt,
+                max_tokens=spec.answer_max_tokens,
+                deadline=spec.deadline,
+            )
             if not picks:
                 # 多选也全空：退化成最高票一格，避免空提交浪费一轮
                 from collections import Counter
@@ -387,6 +475,9 @@ async def solve_canvas_grid(page, spec, shot_dir):
                 if pc:
                     picks = [pc.most_common(1)[0][0]]
                     print(f"  [canvas] R{rnd} 多选无共识，兜底点最高票 #{picks[0]}")
+            if not picks and not votes:
+                print(f"  [canvas] R{rnd} no valid vision answer; refusing empty submit")
+                return False
         print(f"  [canvas] R{rnd} ins={instruction[:48]!r} layout={rows}x{cols} "
               f"single={single} -> {picks} votes={votes}")
         try:
@@ -399,16 +490,21 @@ async def solve_canvas_grid(page, spec, shot_dir):
         # 按像素坐标点选中格
         cells_xy = (geom or {}).get("cells_xy", [])
         clicked = 0
-        for i in picks:
-            if 0 <= i < len(cells_xy):
-                cx, cy = cells_xy[i]
-                if await _click_canvas_cell(frame, spec.canvas_sel, cx, cy, canvas_w, canvas_h):
-                    clicked += 1
-                    await asyncio.sleep(0.35)
-        print(f"  [canvas] R{rnd} 点了 {clicked}/{len(picks)} 格")
+        click_targets = direct_clicks or [
+            cells_xy[index]
+            for index in picks
+            if 0 <= index < len(cells_xy)
+        ]
+        for cx, cy in click_targets:
+            if await _click_canvas_cell(
+                frame, spec.canvas_sel, cx, cy, canvas_w, canvas_h
+            ):
+                clicked += 1
+                await asyncio.sleep(0.35)
+        print(f"  [canvas] R{rnd} clicked {clicked}/{len(click_targets)} targets")
 
         # 提交（hCaptcha 是 Verify/Skip 同一个 .button-submit）
-        if spec.submit_sel:
+        if spec.submit_sel and clicked > 0:
             try:
                 await frame.locator(spec.submit_sel).first.click(timeout=5000)
                 submitted = True
@@ -435,32 +531,43 @@ async def solve_canvas_grid(page, spec, shot_dir):
 # ———————————————————— canvas_drag（画布拖拽：把piece拖到target） ————————————————————
 
 async def _drag_on_canvas(frame, page, canvas_sel, fr, to, canvas_w, canvas_h, steps=24):
-    """在 canvas 上把归一化点 fr=(fx,fy) 拖到 to=(tx,ty)。用真实 mouse down/move/up，
-    分步移动模拟人手（hCaptcha 会查瞬移）。fr/to 为 0..1，按元素 CSS 尺寸换算到页面坐标。"""
+    """Drag between normalized canvas points using a human-like trajectory."""
     el = frame.locator(canvas_sel).first
     box = await el.bounding_box()
     if not box:
-        print("  [drag] 拿不到 canvas bbox")
+        print("  [drag] unable to read canvas bbox")
         return False
     x0 = box["x"] + box["width"] * fr[0]
     y0 = box["y"] + box["height"] * fr[1]
     x1 = box["x"] + box["width"] * to[0]
     y1 = box["y"] + box["height"] * to[1]
+    print(
+        f"  [drag] canvas_css={box['width']:.0f}x{box['height']:.0f} "
+        f"image={canvas_w}x{canvas_h} mouse=({x0:.0f},{y0:.0f})->({x1:.0f},{y1:.0f})"
+    )
     try:
-        await page.mouse.move(x0, y0)
-        await asyncio.sleep(0.12)
+        from common import human_mouse
+
+        await human_mouse.human_move_to(page, x0, y0)
+        await asyncio.sleep(random.uniform(0.14, 0.32))
         await page.mouse.down()
-        await asyncio.sleep(0.12)
-        for i in range(1, steps + 1):
-            t = i / steps
-            # 轻微缓动 + 抖动，像人手
-            import random
-            jx = random.uniform(-1.5, 1.5)
-            jy = random.uniform(-1.5, 1.5)
-            await page.mouse.move(x0 + (x1 - x0) * t + jx, y0 + (y1 - y0) * t + jy)
-            await asyncio.sleep(0.012)
+        await asyncio.sleep(random.uniform(0.10, 0.22))
+        path = human_mouse.windmouse_path(
+            x0, y0, x1, y1, gravity=8.0, wind=2.4,
+            max_step=11.0, target_area=14.0,
+        )
+        for index, (px, py) in enumerate(path):
+            await page.mouse.move(
+                px + random.uniform(-0.45, 0.45),
+                py + random.uniform(-0.45, 0.45),
+            )
+            progress = index / max(1, len(path) - 1)
+            edge_slowdown = 1.0 - math.sin(math.pi * progress)
+            await asyncio.sleep(
+                random.uniform(0.006, 0.013) + edge_slowdown * 0.009
+            )
         await page.mouse.move(x1, y1)
-        await asyncio.sleep(0.12)
+        await asyncio.sleep(random.uniform(0.12, 0.28))
         await page.mouse.up()
         return True
     except Exception as e:
@@ -477,6 +584,7 @@ async def solve_canvas_drag(page, spec, shot_dir):
     返回 True/False。需要 spec.mode='canvas_drag'。"""
     os.makedirs(shot_dir, exist_ok=True)
     submitted = False
+    empty_answers = 0
     for rnd in range(spec.max_rounds):
         frame = await _find_frame(page, spec.frame_match)
         if frame is None:
@@ -501,7 +609,11 @@ async def solve_canvas_drag(page, spec, shot_dir):
         img_hd = enhance_local(img, f"{shot_dir}/drag_r{rnd}_hd.png", scale=1)
 
         prompt = build_prompt(spec, instruction, 0)
-        fr, to, raws = vote_points(prompt, img_hd, deadline=spec.deadline)
+        # Gemini 3.6 may spend most of a 900-token budget on visual reasoning
+        # and truncate before its final FROM/TO line.
+        fr, to, raws = vote_points(
+            prompt, img_hd, max_tokens=1800, deadline=spec.deadline
+        )
         print(f"  [drag] R{rnd} ins={instruction[:48]!r} FROM={fr} TO={to}")
         # 复盘：在原图上画 FROM(蓝)->TO(红) 箭头
         try:
@@ -511,8 +623,13 @@ async def solve_canvas_drag(page, spec, shot_dir):
             pass
         if not fr or not to:
             print(f"  [drag] R{rnd} 投票无有效坐标，跳过")
+            empty_answers += 1
+            if empty_answers >= 2:
+                print("  [drag] consecutive vision failures; using another solver")
+                return False
             await asyncio.sleep(1.0)
             continue
+        empty_answers = 0
 
         await _drag_on_canvas(frame, page, spec.canvas_sel, fr, to, canvas_w, canvas_h)
         await asyncio.sleep(spec.settle_ms / 1000)

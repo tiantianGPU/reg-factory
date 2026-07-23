@@ -182,9 +182,11 @@ curl -fsSL "https://raw.githubusercontent.com/tiantianGPU/reg-factory/main/boots
 - **⚙️ 配置(.env)** 页：分组填写所有密钥（密码框遮挡），每类带**连通测试按钮**——
   Clash（验证控制器 + secret）、指纹浏览器、sms-man / firefox.fun 接码平台，一键看通不通。
   指纹浏览器 provider 可在页面里用下拉框切换 `bitbrowser` / `adspower`。
+- **Claude 注册与验证**配置组：集中设置节点探测、Cloudflare 等待、hCaptcha 重试、视觉网关/模型和浏览器内核；单任务页可直接填写与 refresh token 配套的 `client-id`。
+- 桌面宽屏使用参数/实时日志双栏，任务结束后显示真实的成功、失败或停止状态；移动端保持单栏和抽屉式任务导航。
 - 保存 `.env` 后，后续新任务和面板管理的子服务立即使用新配置，无需重启主服务。
 - 更新代码请使用 `update.bat` / `update.sh`（或上面的一键更新命令）；脚本会拒绝中断运行中的注册任务，并在更新依赖后重启、核对 WebUI 提交版本，避免页面仍使用旧 schema。
-- 桌面端与移动端自适应；移动端使用抽屉式任务导航，顶栏可直接打开 Telegram 联系二维码。
+- 移动端顶栏可直接打开 Telegram 联系二维码。
 - 仅监听 `127.0.0.1`，含密钥不暴露公网。
 
 > 面板只是给现有命令行脚本套了个壳：拼好命令 → 起子进程 → 收实时输出，行为与下面的 CLI 完全一致。
@@ -225,12 +227,21 @@ cp .env.example .env
 | `ADSPOWER_API` | AdsPower 本地 API（默认 `http://127.0.0.1:50325`） | 使用 AdsPower 时 |
 | `ADSPOWER_API_KEY` | AdsPower Local API 鉴权 key（未启用鉴权可留空） | 否 |
 | `ADSPOWER_GROUP_ID` | AdsPower 新建 profile 的分组 ID（默认 `0`） | 否 |
+| `CLAUDE_CHALLENGE_WAIT_SECONDS` | Claude 每个节点等待 Cloudflare 自动验证的秒数（默认 `45`） | 否 |
+| `CLAUDE_CHALLENGE_NODE_RETRIES` | Claude 自动模式提交邮箱前的节点轮换次数（默认 `3`） | 否 |
+| `CLAUDE_CAPTCHA_MANUAL_TIMEOUT` | 图形验证人工接管等待秒数（默认 `0` 关闭；可设 `180`） | 否 |
+| `CLAUDE_HCAPTCHA_SOLVE_RETRIES` | Claude magic-link hCaptcha 的 YesCaptcha 重试次数（默认 `2`） | 否 |
+| `CLAUDE_VISION_API_BASE` / `CLAUDE_VISION_API_KEY` | Claude hCaptcha 专用视觉网关；留空时复用通用 `VISION_*` | 自动视觉求解时 |
+| `CLAUDE_VISION_MODEL` | Claude hCaptcha 主视觉模型（默认 `gemini-3.6-flash`） | 否 |
+| `CLAUDE_BROWSER_CORE_VERSION` | Claude 注册和 sessionKey 校验使用的 Chromium 指纹（默认 `146`） | 否 |
+| `CLAUDE_NODE_PROBE_LIMIT` / `CLAUDE_NODE_PROBE_TIMEOUT_SECONDS` | 启动时快速探测的新节点数 / 单节点超时（默认 `6` / `8` 秒） | 否 |
 | `SMS_TOKEN` | 接码平台 firefox.fun 的 token | 需手机号时必填 |
 | `HERO_SMS_API_KEY` | 备用接码 hero-sms.com 的 api_key | 否 |
-| `YESCAPTCHA_API_KEY` | YesCaptcha key（Grok Turnstile 首选回退，也可用于 GitHub Arkose） | Grok 与 CapSolver 二选一 |
+| `YESCAPTCHA_API_KEY` | YesCaptcha key（Claude hCaptcha 备用、Grok Turnstile、GitHub Arkose） | 按需 |
 | `CAPSOLVER_API_KEY` | CapSolver 打码 key（Grok Turnstile 回退） | Grok 与 YesCaptcha 二选一 |
 | `EZCAPTCHA_API_KEY` | EZ-Captcha 打码 key | 按需 |
 | `OUTLOOK_PROXIES` | Outlook 自注册住宅代理池，`user:pass@host:port`，换行/逗号分隔 | 否 |
+| `OUTLOOK_UI_LOCALE` | Outlook 注册及 Graph OAuth 的首选界面语言（默认 `en-US`，页面忽略时自动按实际语言适配） | 否 |
 | `MAIL_*` | 备用域名邮箱（一般用不到） | 否 |
 
 **Codex / 标准 token 上传（按需启用，留空自动跳过）**
@@ -310,6 +321,7 @@ python register_outlook_standalone.py --count 5 --mode browser --confirm-before-
 
 - **`canvas_grid`（点击型）**：稳定截画布 → 按行列叠加编号网格（四边内缩对齐真实图块）→ 多模型投票 → **按像素坐标点 canvas** → 提交。题干自动判单选（`the item/thing`）/ 卡片（`card/different`）/ 多选（`select all`）。
 - **`canvas_drag`（拖拽型）**：多模型投票 `FROM/TO` 归一化坐标（取中位数抗离群）→ **鼠标分步带抖动拖放**（模拟人手）→ 提交。
+- **Claude 重复题型优化**：按多语言题干识别动物、珠链和线段题；珠链可用本地图像几何检测复核最短两组，线段题接受两个端点坐标并直接点击，长度比较题可启用多模型投票降低单模型误判。
 
 ```python
 from vision_solver import solve, CaptchaSpec
@@ -357,6 +369,7 @@ python extract_graph_tokens.py --email a@outlook.com --password xxx
 python extract_graph_tokens.py accounts.txt --concurrency 10     # 并发数(默认 5)
 ```
 > 走系统代理（Clash），避免 `account.live.com` 限流；账号文件每行 `email----password----...`。
+> OAuth 页面会优先请求 `OUTLOOK_UI_LOCALE`（默认 `en-US`），同时兼容出口 IP 返回的中、英、法、西、德、葡、意、荷、波、俄、土、日、韩页面。
 
 ### Clash 节点自检
 ```bash
@@ -528,7 +541,7 @@ python upload_tokens.py chatgpt    # 只传 ChatGPT（CPA + SUB2API）
 python upload_tokens.py grok       # 只传 Grok（SUB2API + webchat2api，按已配置目标执行）
 ```
 > ⚠️ ChatGPT 这条是 **Path A（兜底）**：从网页 session 上传，**无 `refresh_token`**（CPA 用合成
-> id_token），下游过期不能续期。**Codex 进 SUB2API/CPA 的正路是上面 ① 的 `oauth_codex.py`（带真
+> id_token），下游过期不能续期。**Codex 进 SUB2API/CPA 的 OAuth 路径是上面 ① 的 `oauth_codex.py`（带真
 > `refresh_token`）**；本路径仅供没走 OAuth 的批量兜底。
 
 ### ③ Grok 注册 → SUB2API Grok OAuth
@@ -553,6 +566,9 @@ python register_grok.py --count 1 --node auto --latest-rt
 
 # Claude 使用最新有效 RT 邮箱，Graph API 收 magic link
 python register.py --count 1 --node auto --latest-rt
+
+# 指定邮箱时，refresh token 与实际签发它的 client_id 必须配套
+python register.py --email a@outlook.com --password xxx --token <refresh> --client-id <client_id> --node auto
 
 # 指定 Grok 分组
 python register_grok_http.py --count 1 --sub2api --sub2api-group grok
@@ -667,6 +683,10 @@ python export_chatgpt2api.py --json                                # 导出 {acc
 
 - **claude 报 app-unavailable-in-region**：claude.com 对本机 IP 区域封锁，需开 Clash 走干净
   节点（`run_full_flow` / `register.py` 的 `--node auto`）。
+- **claude 出现“Performing security verification”或图形验证**：脚本会先等待 Cloudflare
+  自动通过，再在提交邮箱前轮换节点；magic-link 的 hCaptcha 会优先使用本地视觉求解，
+  YesCaptcha 作为备用，并在求解前排除地区限制或 Cloudflare 节点。需要人工接管时在 `.env` 设置
+  `CLAUDE_CAPTCHA_MANUAL_TIMEOUT=180`，在 BitBrowser 完成后流程会自动继续。
 - **grok 全页 Cloudflare 拦截**：必须切 Clash 节点；`register_grok_http.py` 会用 curl_cffi 指纹
   逐个试节点找能过的。台湾/香港/新加坡节点常被 403，日本/美国较易通过。
 - **三窗口登录同一 outlook 报并发登录**：用 `mailbox_broker.py` 共享取码（每号只登一次）。

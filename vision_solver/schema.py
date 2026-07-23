@@ -59,6 +59,7 @@ class CaptchaSpec:
     cols: int = 3                     # 拼网格列数 / 网格列数
     max_rounds: int = 6               # 一关最多几轮（reCAPTCHA 选完常出新图）
     deadline: int = 55                # 单轮投票最多等几秒
+    answer_max_tokens: int = 900      # Vision response budget; lower for strict short answers
     settle_ms: int = 800              # 每步操作后等待（页面渲染）
     # 判通过：挑战 frame 消失 / 出现成功标志文本（任一命中即算过）
     success_gone_frame: bool = True
@@ -84,8 +85,8 @@ GRID_PROMPT = (
     "The image below is a grid of tiles labeled #0,#1,#2,... in reading order (left-to-right, top-to-bottom). "
     "Task: \"{instruction}\". "
     "Look at every tile and decide which tiles contain the requested object (even partially). "
-    "Reason briefly, then output the VERY LAST line exactly as: PICK=[a,b,c] "
-    "(a JSON-style list of the matching tile numbers; empty list PICK=[] if none)."
+    "Return exactly one line and no explanation: PICK=[a,b,c] "
+    "(a JSON-style list of the matching tile numbers; use PICK=[] if none)."
 )
 
 SINGLE_PROMPT = (
@@ -98,11 +99,14 @@ SINGLE_PROMPT = (
 
 DRAG_PROMPT = (
     "You are an accessibility helper solving a drag-and-drop visual puzzle. "
-    "The image has a movable piece and a target location. "
+    "The movable piece is usually the full-color character in a card on the right. "
+    "The destination is exactly one dark silhouette among several candidates on the left. "
+    "Compare the complete outer contour carefully, especially the head or snout, tail, "
+    "arms, legs, and pose. Ignore colors, background grid bars, and other silhouettes. "
     "Task: \"{instruction}\". "
     "Give the pixel position to grab (the movable piece's center) and where to drop it (the target's center), "
     "as fractions 0..1 of the image (x from left edge, y from top edge). "
-    "Reason briefly, then output the VERY LAST line EXACTLY as: FROM=(x,y) TO=(x,y) "
+    "Use at most one short sentence of reasoning, then output the VERY LAST line EXACTLY as: FROM=(x,y) TO=(x,y) "
     "e.g. FROM=(0.20,0.55) TO=(0.78,0.40)."
 )
 

@@ -37,7 +37,16 @@ try:
 except Exception:
     check_account_api = None
 from config import (
+    CLAUDE_CAPTCHA_MANUAL_TIMEOUT,
+    CLAUDE_HCAPTCHA_SOLVE_RETRIES,
+    CLAUDE_VISION_API_BASE,
+    CLAUDE_VISION_API_KEY,
+    CLAUDE_VISION_MODEL,
+    CLAUDE_CHALLENGE_NODE_RETRIES,
+    CLAUDE_CHALLENGE_WAIT_SECONDS,
     CLAUDE_LOGIN_URL,
+    CLAUDE_NODE_PROBE_LIMIT,
+    CLAUDE_NODE_PROBE_TIMEOUT_SECONDS,
     COOKIE_OUTPUT_DIR,
     SMS_API_BASE,
     SMS_COUNTRY_BLACKLIST,
@@ -51,6 +60,8 @@ from config import (
     CAPSOLVER_API_KEY,
     EZCAPTCHA_API_KEY,
     EZCAPTCHA_API_BASE,
+    YESCAPTCHA_API_KEY,
+    YESCAPTCHA_API_BASE,
 )
 
 # single registration timeout (seconds)
@@ -59,12 +70,145 @@ REGISTER_TIMEOUT = 600
 # Clash 代理：claude.com 对本机 IP 区域封锁(app-unavailable-in-region)，走干净节点绕过。
 # None/"none" = 不走代理(默认，向后兼容)；"auto" = 自动探测能进 claude 的节点；其它 = 指定节点名。
 CLAUDE_PROXY_NODE = None
+CLAUDE_PROXY_AUTO = False
 CLAUDE_PROXY_HOST = "127.0.0.1"
 CLAUDE_PROXY_PORT = "7897"
+CLAUDE_BROWSER_CORE_VERSION = os.environ.get(
+    "CLAUDE_BROWSER_CORE_VERSION", os.environ.get("BB_CORE_VERSION", "146")
+)
+CLAUDE_EMAIL_SELECTOR = 'input[type="email"], input[name="email"], input[id="email"]'
+CLAUDE_COOKIE_REJECT_LABELS = (
+    "Reject All Cookies", "Reject all", "Reject non-essential cookies",
+    "Alle Cookies ablehnen", "Alle ablehnen",
+    "Nur notwendige Cookies", "Nur erforderliche Cookies",
+    "すべて拒否", "必須項目以外を拒否する",
+    "拒绝所有", "拒絕所有",
+)
+CLAUDE_COOKIE_ACCEPT_LABELS = (
+    "Accept All Cookies", "Accept all", "Accept",
+    "Alle Cookies akzeptieren", "Alle akzeptieren", "Annehmen", "Akzeptieren",
+    "すべて受け入れる", "全部接受", "接受所有",
+)
 # 节点轮换：同一节点 IP 连续注册 1-2 个新 Claude 号就会被风控打 /restricted，
 # 故记录最近用过的节点、auto 选号时避开，雨露均沾分散 IP 信誉。
 CLAUDE_NODE_USAGE_FILE = "claude_node_usage.txt"
+CLAUDE_WEB_LOGIN_HCAPTCHA_SITEKEY = "a8086506-2036-46f4-ae50-00d8be805efa"
+CLAUDE_HCAPTCHA_DRAG_MARKERS = (
+    "drag", "drop", "move the", "drag-and-drop",
+    "\ub04c\uc5b4\ub2e4", "\ub4dc\ub798\uadf8",
+    "\u30c9\u30e9\u30c3\u30b0", "\u62d6\u52a8", "\u62d6\u66f3", "\u62d6\u653e",
+    "ziehen sie", "verschieben", "faites glisser", "arrastra", "arraste",
+)
+CLAUDE_HCAPTCHA_TREE_CLIMBER_MARKERS = (
+    "climb straight up tree trunks",
+    "climb straight up a tree trunk",
+    "\ub098\ubb34 \uae30\ub465\uc744 \uacf7\uc7a5 \uc624\ub974\ub294 \ub3d9\ubb3c",
+)
+CLAUDE_HCAPTCHA_SHORTEST_CHAIN_MARKERS = (
+    "two shortest chains",
+    "shortest two chains",
+    "2 shortest chains",
+    "\uac00\uc7a5 \uc9e7\uc740 \ub450 \uac1c\uc758 \uccb4\uc778",
+)
+CLAUDE_HCAPTCHA_LONGEST_CHAIN_MARKERS = (
+    "two longest chains",
+    "longest two chains",
+    "2 longest chains",
+    "\uac00\uc7a5 \uae34 \ub450 \uac1c\uc758 \uccb4\uc778",
+)
+CLAUDE_HCAPTCHA_SHORTEST_LINE_MARKERS = (
+    "two shortest lines",
+    "shortest two lines",
+    "2 shortest lines",
+    "\uac00\uc7a5 \uc9e7\uc740 \ub450 \uac1c\uc758 \uc120",
+    "\uac00\uc7a5 \uc9e7\uc740 \uc120",
+)
+CLAUDE_HCAPTCHA_LONGEST_LINE_MARKERS = (
+    "two longest lines",
+    "longest two lines",
+    "2 longest lines",
+    "\uac00\uc7a5 \uae34 \ub450 \uac1c\uc758 \uc120",
+    "\uac00\uc7a5 \uae34 \uc120",
+)
 CLAUDE_NODE_AVOID_RECENT = 3  # 避开最近 N 次用过的节点
+CLAUDE_HTTP_BLOCK_MARKERS = (
+    "app-unavailable-in-region",
+    "unavailable in your",
+    "just a moment",
+    "performing security",
+    "사람인지 확인",
+    "보안 확인",
+    "正在验证",
+    "验证您是否是真人",
+    "人間であることを確認",
+)
+
+HCAPTCHA_HOOK_JS = r"""
+(() => {
+    if (window.__rfHcaptchaHookLoaded) return;
+    window.__rfHcaptchaHookLoaded = true;
+    window.__rfHcaptchaCaptured = window.__rfHcaptchaCaptured || [];
+    window.__rfHcaptchaCallbacks = window.__rfHcaptchaCallbacks || [];
+    let current = window.hcaptcha;
+    const wrap = (api) => {
+        if (!api || typeof api.render !== 'function' || api.render.__rfWrapped) return api;
+        const original = api.render.bind(api);
+        const wrappedRender = function(container, params) {
+            const p = params || {};
+            window.__rfHcaptchaCaptured.push({
+                sitekey: p.sitekey || '',
+                rqdata: p.rqdata || '',
+                size: p.size || '',
+                action: p.action || ''
+            });
+            if (typeof p.callback === 'function') {
+                window.__rfHcaptchaCallback = p.callback;
+                window.__rfHcaptchaCallbacks.push(p.callback);
+            }
+            if (typeof p['error-callback'] === 'function') {
+                window.__rfHcaptchaErrorCallback = p['error-callback'];
+            }
+            return original(container, params);
+        };
+        wrappedRender.__rfWrapped = true;
+        api.render = wrappedRender;
+        window.__rfHcaptchaApi = api;
+        return api;
+    };
+    try {
+        Object.defineProperty(window, 'hcaptcha', {
+            configurable: true,
+            get() { return current; },
+            set(value) { current = wrap(value); }
+        });
+    } catch (e) {}
+    // hCaptcha first assigns an incomplete window.hcaptcha object, then invokes
+    // its named onload callback as soon as render() is attached. Wrap at that
+    // boundary so Claude's immediate Promise microtask cannot beat our poller.
+    const originalAppendChild = Element.prototype.appendChild;
+    Element.prototype.appendChild = function(node) {
+        try {
+            if (node instanceof HTMLScriptElement && /js\.hcaptcha\.com\/1\/api\.js/i.test(node.src)) {
+                const readyName = new URL(node.src, location.href).searchParams.get('onload');
+                const ready = readyName && window[readyName];
+                if (typeof ready === 'function' && !ready.__rfWrapped) {
+                    const wrappedReady = function(...args) {
+                        try { current = wrap(window.hcaptcha); } catch (e) {}
+                        return ready.apply(this, args);
+                    };
+                    wrappedReady.__rfWrapped = true;
+                    window[readyName] = wrappedReady;
+                }
+            }
+        } catch (e) {}
+        return originalAppendChild.call(this, node);
+    };
+    window.setInterval(() => {
+        try { if (window.hcaptcha) current = wrap(window.hcaptcha); } catch (e) {}
+    }, 20);
+    if (current) current = wrap(current);
+})();
+"""
 
 
 def _recent_claude_nodes(limit=CLAUDE_NODE_AVOID_RECENT):
@@ -84,25 +228,151 @@ def _record_claude_node(node):
         pass
 
 
-def _pick_claude_node():
-    """auto 选节点：避开最近用过的节点找一个能过 claude CF 的；找不到再放开全量。返回节点名或 None。"""
-    markers = ("app-unavailable-in-region", "unavailable in your",
-               "just a moment", "performing security")
+def _warm_claude_http_session(session, label):
+    """Reject region/Cloudflare pages before sending mail or buying a solve."""
+    try:
+        response = session.get(CLAUDE_LOGIN_URL, timeout=20, allow_redirects=True)
+    except Exception as e:
+        print(f"  [{label}] Claude route preflight error: {str(e)[:120]}")
+        return False
+    body = (getattr(response, "text", "") or "").lower()
+    marker = next((item for item in CLAUDE_HTTP_BLOCK_MARKERS if item in body), "")
+    if response.status_code != 200 or marker:
+        reason = f"marker={marker}" if marker else "blocked response"
+        print(f"  [{label}] Claude route preflight failed: HTTP {response.status_code} {reason}")
+        return False
+    return True
+
+
+def _claude_json_response(response):
+    """Return a Claude API JSON object, rejecting 200 HTML challenge pages."""
+    content_type = (response.headers.get("content-type", "") or "").lower()
+    body = (getattr(response, "text", "") or "").lower()
+    if "json" not in content_type:
+        return None
+    if any(marker in body for marker in CLAUDE_HTTP_BLOCK_MARKERS):
+        return None
+    try:
+        data = response.json()
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else {}
+
+
+def _pick_claude_node(exclude=None):
+    """Quickly probe fresh nodes, then fall back to recent known-good nodes."""
+    markers = CLAUDE_HTTP_BLOCK_MARKERS
     try:
         alln = proxy_switch.concrete_nodes()
     except Exception as e:
         print(f"  [proxy] 取节点列表失败: {e}")
         return None
-    recent = set(_recent_claude_nodes())
-    fresh = [n for n in alln if n not in recent] or alln
-    print(f"  [proxy] 避开最近节点 {sorted(recent)}; 在 {len(fresh)}/{len(alln)} 个候选里探测...")
-    node = proxy_switch.find_working_node(
-        test_url="https://claude.ai/login", challenge_markers=markers, candidates=fresh)
-    if not node and fresh is not alln:
-        print("  [proxy] 新鲜节点都不通，放开全量重探...")
+    excluded = set(exclude or ())
+    alln = [node for node in alln if node not in excluded]
+    if not alln:
+        print("  [proxy] no untried Claude nodes remain")
+        return None
+    recent_order = []
+    for node in reversed(_recent_claude_nodes()):
+        if node in alln and node not in recent_order:
+            recent_order.append(node)
+    recent = set(recent_order)
+    fresh = [node for node in alln if node not in recent]
+    probe_limit = max(1, CLAUDE_NODE_PROBE_LIMIT)
+    probe_timeout = max(3, CLAUDE_NODE_PROBE_TIMEOUT_SECONDS)
+    candidates = random.sample(fresh, min(probe_limit, len(fresh))) if fresh else []
+
+    if candidates:
+        print(f"  [proxy] 快速探测新节点 {len(candidates)}/{len(fresh)} "
+              f"(单节点最多 {probe_timeout}s)...")
         node = proxy_switch.find_working_node(
-            test_url="https://claude.ai/login", challenge_markers=markers, candidates=alln)
-    return node
+            test_url="https://claude.ai/login",
+            challenge_markers=markers,
+            candidates=candidates,
+            settle=1,
+            timeout=probe_timeout,
+        )
+        if node:
+            return node
+
+    for recent_node in recent_order:
+        print(f"  [proxy] 新节点未命中，回退最近可用节点: {recent_node}")
+        node = proxy_switch.find_working_node(
+            test_url="https://claude.ai/login",
+            challenge_markers=markers,
+            candidates=[recent_node],
+            settle=1,
+            timeout=probe_timeout,
+        )
+        if node:
+            return node
+
+    print("  [proxy] 本轮快速预检没有可用节点，交给浏览器阶段继续轮换")
+    return None
+
+
+class ClaudeChallengeError(RuntimeError):
+    """Claude login is still behind a Cloudflare Managed Challenge."""
+
+
+def claude_browser_fingerprint():
+    """Use the installed modern BitBrowser core with exit-IP-derived locale."""
+    return {
+        "ostype": "PC",
+        "os": "Win32",
+        "coreVersion": CLAUDE_BROWSER_CORE_VERSION,
+        "isIpCreateTimeZone": True,
+        "isIpCreateLanguage": True,
+        "isIpCreateDisplayLanguage": True,
+        "isIpCreatePosition": True,
+        "isIpCountry": True,
+    }
+
+
+def _claude_hcaptcha_grid_prompt(instruction):
+    """Clarify recurring behavioral labels that vision models misclassify."""
+    normalized = (instruction or "").strip().lower()
+    if any(marker in normalized for marker in CLAUDE_HCAPTCHA_TREE_CLIMBER_MARKERS):
+        return (
+            "Inspect all nine numbered tiles. The page task describes animals that "
+            "climb straight up tree trunks; in this challenge category that means "
+            "squirrels. Select every tile containing a squirrel, including blurred "
+            "or stylized squirrel images. Do not select chameleons, kangaroos, "
+            "penguins, otters, or sloths. Return exactly one line and no explanation: "
+            "PICK=[a,b,c]. Use PICK=[] only when no squirrel is present."
+        )
+    chain_order = None
+    if any(marker in normalized for marker in CLAUDE_HCAPTCHA_SHORTEST_CHAIN_MARKERS):
+        chain_order = "shortest"
+    elif any(marker in normalized for marker in CLAUDE_HCAPTCHA_LONGEST_CHAIN_MARKERS):
+        chain_order = "longest"
+    if chain_order:
+        return (
+            f"Identify the TWO {chain_order} chains among the separate colored bead "
+            "chains in the complete image. The red 3x3 grid is only a click guide. Choose exactly "
+            "one numbered cell per chain, and choose a cell whose CENTER visibly "
+            "overlaps that chain. If a chain crosses a boundary, choose the side "
+            "containing the chain's middle bead; never list both boundary cells. "
+            "Do not explain, count, give coordinates, or mention any unselected "
+            "cell. Your ENTIRE response must be exactly PICK=[a,b], with two "
+            "distinct cell numbers."
+        )
+    line_order = None
+    if any(marker in normalized for marker in CLAUDE_HCAPTCHA_SHORTEST_LINE_MARKERS):
+        line_order = "shortest"
+    elif any(marker in normalized for marker in CLAUDE_HCAPTCHA_LONGEST_LINE_MARKERS):
+        line_order = "longest"
+    if line_order:
+        return (
+            f"Identify the TWO {line_order} separate thick colored lines in the "
+            "complete image. Ignore the textured background and thin background "
+            "rays. Return one click point near the midpoint of each selected line. "
+            "Coordinates are fractions from 0 to 1 of the FULL image width and "
+            "height, x from left and y from top. FROM and TO mean the first and "
+            "second click; do not describe a drag. Do not explain. Your ENTIRE "
+            "response must be exactly FROM=(x1,y1) TO=(x2,y2)."
+        )
+    return ""
 
 # web2api 验证服务地址
 WEB2API_BASE = "http://127.0.0.1:9000"
@@ -519,8 +789,8 @@ async def inject_arkose_token(page, token):
 
 # ========== Outlook Registration ==========
 
-async def register_outlook(page):
-    """Register a new outlook email account, returns (email, password) or (None, None)"""
+async def _register_outlook_legacy(page):
+    """Legacy inline Outlook flow kept temporarily for diagnostics."""
     os.makedirs("screenshots", exist_ok=True)
     try:
         await page.goto("https://signup.live.com/signup?lic=1", timeout=30000)
@@ -1312,6 +1582,17 @@ async def register_outlook(page):
             pass
         return None, None
 
+
+async def register_outlook(page):
+    """Use the maintained locale-adaptive Outlook registration flow."""
+    try:
+        from register_outlook_standalone import register_outlook as shared_register_outlook
+
+        return await shared_register_outlook(page, page.context, idx=0)
+    except Exception as exc:
+        print(f"  [outlook] shared registration failed: {type(exc).__name__}: {exc}")
+        return None, None
+
 async def _replit_click_email_submit(page, tag):
     """Find and click the email-form submit button, skipping OAuth buttons."""
     btns_info = await page.evaluate("""
@@ -1587,6 +1868,20 @@ CONTINUE_EMAIL_LABELS = [
 
 async def click_continue_email(page, timeout=8000):
     """点击 Claude 的'用邮箱继续/Continue'按钮，多语言精确匹配；命中即 True。"""
+    # Bind to the email input's own form first. The responsive page can keep a
+    # hidden duplicate button that makes a global role locator's `.last` wait
+    # until timeout even though the visible submit button is ready.
+    try:
+        email_input = page.locator(CLAUDE_EMAIL_SELECTOR).first
+        form = email_input.locator("xpath=ancestor::form[1]")
+        if await form.count() > 0:
+            submit = form.locator('button[type="submit"], input[type="submit"]').first
+            if await submit.count() > 0 and await submit.is_visible():
+                await submit.click(timeout=timeout)
+                print("  clicked continue (visible email form submit)")
+                return True
+    except Exception:
+        pass
     for label in CONTINUE_EMAIL_LABELS:
         try:
             btn = page.get_by_role("button", name=label, exact=True)
@@ -1609,7 +1904,163 @@ async def click_continue_email(page, timeout=8000):
             return True
     except Exception:
         pass
+    try:
+        email_input = page.locator(CLAUDE_EMAIL_SELECTOR).first
+        if await email_input.count() > 0 and await email_input.is_visible():
+            await email_input.press("Enter", timeout=timeout)
+            print("  submitted email with Enter")
+            return True
+    except Exception:
+        pass
     return False
+
+
+async def request_claude_magic_link(page, email):
+    """Use Claude's same-origin login endpoint once the app login page is ready."""
+    try:
+        result = await page.evaluate("""async ({email}) => {
+            try {
+                const response = await fetch('/api/auth/send_magic_link', {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {'content-type': 'application/json'},
+                    body: JSON.stringify({
+                        email_address: email,
+                        utc_offset: new Date().getTimezoneOffset(),
+                        login_intent: null,
+                        locale: document.documentElement.lang || navigator.language || null,
+                        oauth_client_id: null,
+                        return_to: null,
+                        source: 'claude'
+                    })
+                });
+                let data = null;
+                try { data = await response.json(); } catch (e) {}
+                return {
+                    ok: response.ok,
+                    status: response.status,
+                    error: data?.error?.message || data?.message || '',
+                    sso: Boolean(data?.sso_url)
+                };
+            } catch (e) {
+                return {ok: false, status: 0, error: String(e), sso: false};
+            }
+        }""", {"email": email})
+    except Exception as e:
+        print(f"  magic-link API interrupted: {str(e)[:120]}")
+        return False
+    if result.get("ok"):
+        if result.get("sso"):
+            print("  magic-link API redirected this domain to SSO")
+            return False
+        print("  magic link requested through Claude API")
+        return True
+    print(f"  magic-link API failed: HTTP {result.get('status', 0)} "
+          f"{str(result.get('error') or '')[:100]}")
+    return False
+
+
+def request_claude_magic_link_http(email):
+    """Request a link with a Chrome TLS fingerprint when browser POST is challenged."""
+    payload = {
+        "email_address": email,
+        "utc_offset": -480,
+        "login_intent": None,
+        "locale": "en-US",
+        "oauth_client_id": None,
+        "return_to": None,
+        "source": "claude",
+    }
+    session = None
+    try:
+        from curl_cffi import requests as curl_requests
+
+        session = curl_requests.Session(impersonate="chrome131", http_version="v2")
+        if proxy_switch is not None and (CLAUDE_PROXY_NODE or CLAUDE_PROXY_AUTO):
+            session.proxies = {
+                "http": proxy_switch.CLASH_PROXY,
+                "https": proxy_switch.CLASH_PROXY,
+            }
+        if not _warm_claude_http_session(session, "magic-send"):
+            return False
+        response = session.post(
+            "https://claude.ai/api/auth/send_magic_link",
+            json=payload,
+            timeout=25,
+        )
+        data = _claude_json_response(response)
+        if response.status_code == 200 and data is not None and not data.get("sso_url"):
+            print("  magic link requested through Chrome-fingerprint HTTP")
+            return True
+        data = data or {}
+        error = (data.get("error") or {}).get("message") or data.get("message") or ""
+        if response.status_code == 200 and not error:
+            error = "non-JSON challenge response"
+        print(f"  Chrome-fingerprint magic-link request failed: HTTP {response.status_code} "
+              f"{str(error)[:100]}")
+    except Exception as e:
+        print(f"  Chrome-fingerprint magic-link request error: {str(e)[:120]}")
+    finally:
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+    return False
+
+
+async def submit_claude_email(page, email, *, allow_node_rotation=True, attempts=2):
+    """Reach a stable login form and submit the email before mailbox polling."""
+    for attempt in range(1, max(1, attempts) + 1):
+        if not await ensure_claude_login_form(
+            page, allow_node_rotation=allow_node_rotation
+        ):
+            break
+        try:
+            await dismiss_claude_cookie_banner(page)
+            email_input = page.locator(CLAUDE_EMAIL_SELECTOR).first
+            await email_input.fill(email)
+            await asyncio.sleep(0.3)
+            requested_at = time.time()
+            try:
+                async with page.expect_response(
+                    lambda response: "/api/auth/send_magic_link" in response.url,
+                    timeout=20000,
+                ) as response_info:
+                    clicked = await click_continue_email(page)
+                response = await response_info.value
+            except Exception as e:
+                print(f"  visible email submit response missing: {str(e)[:100]}")
+                response = None
+                clicked = False
+            if clicked and response and response.status == 200:
+                print("  magic link requested through visible Claude email form")
+                setattr(page, "_rf_visible_email_submitted", True)
+                return requested_at
+            if response is not None:
+                print(f"  visible Claude email form failed: HTTP {response.status}")
+        except Exception as e:
+            print(f"  email submission interrupted: {str(e)[:120]}")
+
+        if attempt >= attempts:
+            break
+        print(f"  email was not submitted; restoring Claude login ({attempt}/{attempts})")
+        await asyncio.sleep(5)
+        try:
+            await page.goto(CLAUDE_LOGIN_URL, timeout=60000)
+            await asyncio.sleep(5)
+        except Exception as e:
+            print(f"  login restore interrupted: {str(e)[:120]}")
+    requested_at = time.time()
+    if await request_claude_magic_link(page, email):
+        print("  visible form unavailable; used current-browser Claude API fallback")
+        setattr(page, "_rf_visible_email_submitted", False)
+        return requested_at
+    if await asyncio.to_thread(request_claude_magic_link_http, email):
+        print("  visible form unavailable; used Chrome-fingerprint HTTP fallback")
+        setattr(page, "_rf_visible_email_submitted", False)
+        return requested_at
+    return None
 
 
 async def get_magic_link_outlook_pw(page, email, password, max_wait=90):
@@ -1968,6 +2419,61 @@ async def human_type(page, selector, text, delay=50):
     await asyncio.sleep(0.3)
 
 
+async def _claude_email_form_ready(page):
+    try:
+        email_input = page.locator(CLAUDE_EMAIL_SELECTOR).first
+        return await email_input.count() > 0 and await email_input.is_visible()
+    except Exception:
+        return False
+
+
+async def _claude_managed_challenge_present(page):
+    title = ""
+    body = ""
+    current_url = ""
+    try:
+        current_url = (page.url or "").lower()
+    except Exception:
+        pass
+    if "/api/challenge_redirect" in current_url or "/cdn-cgi/challenge-platform" in current_url:
+        return True
+    try:
+        title = (await page.title()).lower()
+    except Exception:
+        pass
+    try:
+        body = (await page.locator("body").inner_text(timeout=2000)).lower()
+    except Exception:
+        pass
+    markers = (
+        "just a moment",
+        "performing security verification",
+        "verify you are human",
+        "verifying you are human",
+        "enable javascript and cookies to continue",
+        "사람인지 확인하는 중입니다",
+        "사람이 맞는지 확인 중입니다",
+        "인간인지 확인",
+        "보안 확인 수행 중",
+        "보안 확인 중",
+        "人間であることを確認しています",
+        "人間であることを確認中",
+        "私はロボットではありません",
+        "数秒かかる場合があります",
+        "正在验证您是否是真人",
+        "正在確認您是否為真人",
+        "正在确认您是真人",
+        "正在執行安全驗證",
+        "正在执行安全验证",
+        "vérification que vous êtes humain",
+        "verificando que eres humano",
+        "überprüfen, ob sie ein mensch sind",
+        "verificando se você é humano",
+        "verifica che tu sia umano",
+    )
+    return any(marker in title or marker in body for marker in markers)
+
+
 async def solve_turnstile(page, max_wait=60):
     """
     Detect and click Cloudflare Turnstile on the current page.
@@ -2027,6 +2533,36 @@ async def solve_turnstile(page, max_wait=60):
     print(f"  [cf] iframes on page: {len(iframe_info)}")
     for fi in iframe_info:
         print(f"    src={fi['src'][:80]} size={fi['width']}x{fi['height']} id={fi['id']}")
+
+    # A full-page Managed Challenge is not a normal embedded Turnstile widget.
+    # Let Cloudflare complete automatically and only click an explicit checkbox.
+    # Clicking arbitrary iframe/body coordinates can escalate it into an image task.
+    if await _claude_managed_challenge_present(page):
+        print(f"  [cf] full-page Managed Challenge; waiting up to {max_wait}s...")
+        checkbox_clicked = False
+        deadline = time.monotonic() + max(0, max_wait)
+        while time.monotonic() < deadline:
+            if await _claude_email_form_ready(page):
+                print("  [cf] Managed Challenge passed; Claude login form is ready")
+                return True
+            if not checkbox_clicked:
+                for frame in page.frames:
+                    if "cloudflare" not in (frame.url or "").lower():
+                        continue
+                    try:
+                        checkbox = frame.locator(
+                            'input[type="checkbox"], label.ctp-checkbox-label, .ctp-checkbox-label'
+                        ).first
+                        if await checkbox.count() > 0 and await checkbox.is_visible():
+                            await checkbox.click()
+                            checkbox_clicked = True
+                            print("  [cf] clicked explicit Cloudflare checkbox")
+                            break
+                    except Exception as e:
+                        print(f"  [cf] checkbox click failed: {e}")
+            await asyncio.sleep(2)
+        print("  [cf] Managed Challenge did not clear")
+        return False
 
     # phase 2: try clicking (multiple rounds)
     clicked = False
@@ -2154,14 +2690,1194 @@ async def solve_turnstile(page, max_wait=60):
         if round_i % 5 == 0 and round_i > 0:
             print(f"  [cf] still working... ({round_i * 3}s)")
 
-    print("  [cf] auto-solve timeout, continuing anyway...")
+    print("  [cf] auto-solve timeout")
     return False
+
+
+async def _capture_claude_challenge(page, attempt):
+    os.makedirs("screenshots", exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = f"screenshots/claude_challenge_{stamp}_{attempt}.png"
+    try:
+        await page.screenshot(path=path)
+        print(f"  [cf] challenge screenshot: {path}")
+    except Exception as e:
+        print(f"  [cf] challenge screenshot failed: {e}")
+
+
+async def ensure_claude_login_form(
+    page,
+    *,
+    allow_node_rotation=True,
+    challenge_wait=None,
+    node_retries=None,
+    manual_timeout=None,
+):
+    """Wait for Claude login, rotating only before an email is submitted."""
+    global CLAUDE_PROXY_NODE
+
+    challenge_wait = max(
+        0,
+        CLAUDE_CHALLENGE_WAIT_SECONDS if challenge_wait is None else int(challenge_wait),
+    )
+    node_retries = max(
+        0,
+        CLAUDE_CHALLENGE_NODE_RETRIES if node_retries is None else int(node_retries),
+    )
+    manual_timeout = max(
+        0,
+        CLAUDE_CAPTCHA_MANUAL_TIMEOUT if manual_timeout is None else int(manual_timeout),
+    )
+    failed_nodes = set()
+
+    for attempt in range(node_retries + 1):
+        await dismiss_claude_cookie_banner(page)
+        if await _claude_email_form_ready(page):
+            return True
+
+        await solve_turnstile(page, max_wait=challenge_wait)
+        if await _claude_email_form_ready(page):
+            return True
+
+        await _capture_claude_challenge(page, attempt + 1)
+        if CLAUDE_PROXY_NODE:
+            failed_nodes.add(CLAUDE_PROXY_NODE)
+
+        can_rotate = (
+            attempt < node_retries
+            and allow_node_rotation
+            and CLAUDE_PROXY_AUTO
+            and proxy_switch is not None
+        )
+        if not can_rotate:
+            break
+
+        print(f"  [cf] rotating Claude node ({attempt + 1}/{node_retries})...")
+        next_node = await asyncio.to_thread(_pick_claude_node, failed_nodes)
+        if not next_node:
+            print("  [cf] no additional Claude node passed the preflight check")
+            break
+        CLAUDE_PROXY_NODE = next_node
+        _record_claude_node(next_node)
+        print(f"  [cf] retrying with node: {next_node}")
+        try:
+            await page.context.clear_cookies()
+        except Exception:
+            pass
+        await page.goto(CLAUDE_LOGIN_URL, timeout=60000)
+        await asyncio.sleep(5)
+
+    if manual_timeout:
+        print(f"  [cf] manual handoff: complete the verification in BitBrowser "
+              f"within {manual_timeout}s")
+        deadline = time.monotonic() + manual_timeout
+        while time.monotonic() < deadline:
+            if await _claude_email_form_ready(page):
+                print("  [cf] manual verification completed")
+                return True
+            await asyncio.sleep(2)
+        await _capture_claude_challenge(page, "manual_timeout")
+
+    return False
+
+
+def _is_hcaptcha_frame_url(url):
+    value = (url or "").lower()
+    return "hcaptcha" in value or "frame=challenge" in value
+
+
+async def _claude_hcaptcha_present(page):
+    for frame in page.frames:
+        if not _is_hcaptcha_frame_url(frame.url):
+            continue
+        try:
+            owner = await frame.frame_element()
+            box = await owner.bounding_box()
+            if box and box.get("width", 0) > 20 and box.get("height", 0) > 20:
+                return True
+        except Exception:
+            pass
+    try:
+        widgets = page.locator(
+            'iframe[src*="hcaptcha"], iframe[src*="frame=challenge"], '
+            '[data-sitekey][data-hcaptcha-widget-id]'
+        )
+        for index in range(await widgets.count()):
+            if await widgets.nth(index).is_visible():
+                return True
+    except Exception:
+        pass
+    return False
+
+
+async def _extract_claude_hcaptcha_params(page, magic_link=None):
+    from urllib.parse import parse_qs, urlsplit
+
+    captured = []
+    sitekeys = []
+    rqdata_values = []
+    callback_count = 0
+    callback_frame = None
+    for frame in page.frames:
+        try:
+            data = await frame.evaluate("""() => ({
+                captured: window.__rfHcaptchaCaptured || [],
+                sitekeys: Array.from(document.querySelectorAll('[data-sitekey]'))
+                    .map(el => el.getAttribute('data-sitekey')).filter(Boolean),
+                rqdata: Array.from(document.querySelectorAll('[data-rqdata]'))
+                    .map(el => el.getAttribute('data-rqdata')).filter(Boolean),
+                callbacks: (window.__rfHcaptchaCallbacks || []).length +
+                    (typeof window.__rfHcaptchaCallback === 'function' ? 1 : 0)
+            })""")
+            captured.extend(data.get("captured") or [])
+            sitekeys.extend(data.get("sitekeys") or [])
+            rqdata_values.extend(data.get("rqdata") or [])
+            frame_callbacks = int(data.get("callbacks") or 0)
+            callback_count += frame_callbacks
+            if (
+                frame_callbacks
+                and frame is page.main_frame
+                and callback_frame is None
+            ):
+                callback_frame = frame
+        except Exception:
+            pass
+
+        parsed = urlsplit(frame.url or "")
+        params = parse_qs(parsed.query)
+        fragment_params = parse_qs(parsed.fragment)
+        for key in ("sitekey", "siteKey", "k"):
+            sitekeys.extend(params.get(key) or fragment_params.get(key) or [])
+        for key in ("rqdata", "rqData"):
+            rqdata_values.extend(params.get(key) or fragment_params.get(key) or [])
+
+    for item in reversed(captured):
+        if item.get("sitekey"):
+            sitekeys.insert(0, item["sitekey"])
+        if item.get("rqdata"):
+            rqdata_values.insert(0, item["rqdata"])
+
+    sitekey = next((value for value in sitekeys if value), "")
+    rqdata = next((value for value in rqdata_values if value), "")
+    try:
+        user_agent = await page.evaluate("() => navigator.userAgent")
+    except Exception:
+        user_agent = ""
+    website_url = (magic_link or page.url).split("#", 1)[0]
+    if not sitekey and "/magic-link" in website_url:
+        sitekey = CLAUDE_WEB_LOGIN_HCAPTCHA_SITEKEY
+        print("  [hcaptcha] using Claude web-login fallback sitekey")
+    invisible = any(str(item.get("size", "")).lower() == "invisible" for item in captured)
+    return {
+        "website_url": website_url,
+        "sitekey": sitekey,
+        "rqdata": rqdata,
+        "user_agent": user_agent,
+        "is_invisible": invisible,
+        "captured_count": len(captured),
+        "callback_count": (
+            callback_count if callback_frame is not None else 0
+        ),
+        "_callback_frame": callback_frame,
+    }
+
+
+def _solve_hcaptcha_yescaptcha(params, max_wait=150):
+    if not YESCAPTCHA_API_KEY:
+        print("  [yescaptcha] API key missing; cannot solve Claude hCaptcha")
+        return None
+    task = {
+        "type": "HCaptchaTaskProxyless",
+        "websiteURL": params["website_url"],
+        "websiteKey": params["sitekey"],
+        "isInvisible": bool(params.get("is_invisible")),
+    }
+    if params.get("user_agent"):
+        task["userAgent"] = params["user_agent"]
+    if params.get("rqdata"):
+        task["rqdata"] = params["rqdata"]
+    bases = []
+    for base in (YESCAPTCHA_API_BASE, "https://cn.yescaptcha.com", "https://api.yescaptcha.com"):
+        base = (base or "").rstrip("/")
+        if base and base not in bases:
+            bases.append(base)
+    created = None
+    endpoint = ""
+    for base in bases:
+        try:
+            created = requests.post(
+                f"{base}/createTask",
+                json={"clientKey": YESCAPTCHA_API_KEY, "task": task},
+                timeout=30,
+            ).json()
+            endpoint = base
+            break
+        except Exception as e:
+            print(f"  [yescaptcha] endpoint {base} unavailable: {str(e)[:90]}")
+    if created is None:
+        return None
+    try:
+        if created.get("errorId", 1):
+            print(f"  [yescaptcha] hCaptcha create error: "
+                  f"{created.get('errorDescription') or created.get('errorCode') or created}")
+            return None
+        task_id = created.get("taskId")
+        print(f"  [yescaptcha] hCaptcha task: {task_id}")
+        deadline = time.monotonic() + max_wait
+        poll_errors = 0
+        while time.monotonic() < deadline:
+            time.sleep(3)
+            try:
+                result = requests.post(
+                    f"{endpoint}/getTaskResult",
+                    json={"clientKey": YESCAPTCHA_API_KEY, "taskId": task_id},
+                    timeout=30,
+                ).json()
+                poll_errors = 0
+            except Exception as e:
+                poll_errors += 1
+                print(
+                    f"  [yescaptcha] result poll error "
+                    f"({poll_errors}/5): {str(e)[:100]}"
+                )
+                if poll_errors >= 5:
+                    return None
+                continue
+            if result.get("errorId"):
+                print(f"  [yescaptcha] hCaptcha failed: "
+                      f"{result.get('errorDescription') or result.get('errorCode')}")
+                return None
+            if result.get("status") == "ready":
+                solution = result.get("solution") or {}
+                token = solution.get("gRecaptchaResponse") or solution.get("token")
+                if token:
+                    print(f"  [yescaptcha] hCaptcha solved (token len={len(token)})")
+                    return {
+                        "token": token,
+                        "resp_key": solution.get("respKey") or "",
+                        "user_agent": solution.get("userAgent") or "",
+                    }
+                print("  [yescaptcha] hCaptcha response contained no token")
+                return None
+        print("  [yescaptcha] hCaptcha timeout")
+    except Exception as e:
+        print(f"  [yescaptcha] hCaptcha error: {str(e)[:120]}")
+    return None
+
+
+def _solve_claude_hcaptcha_yescaptcha(params):
+    attempts = max(1, CLAUDE_HCAPTCHA_SOLVE_RETRIES)
+    for attempt in range(1, attempts + 1):
+        solution = _solve_hcaptcha_yescaptcha(params)
+        if solution:
+            return solution
+        if attempt < attempts:
+            print(f"  [yescaptcha] retrying Claude hCaptcha ({attempt + 1}/{attempts})")
+    return None
+
+
+def _verify_claude_magic_link_http(magic_link):
+    """Verify a magic-link nonce with a YesCaptcha attestation over Chrome TLS."""
+    from urllib.parse import urlsplit
+
+    fragment = urlsplit(magic_link).fragment
+    nonce, separator, encoded_email = fragment.partition(":")
+    if not separator or not nonce or not encoded_email:
+        print("  [magic-http] invalid Claude magic-link fragment")
+        return None
+    user_agent = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+    session = None
+    try:
+        from curl_cffi import requests as curl_requests
+
+        session = curl_requests.Session(impersonate="chrome131", http_version="v2")
+        if proxy_switch is not None and (CLAUDE_PROXY_NODE or CLAUDE_PROXY_AUTO):
+            session.proxies = {
+                "http": proxy_switch.CLASH_PROXY,
+                "https": proxy_switch.CLASH_PROXY,
+            }
+        if not _warm_claude_http_session(session, "magic-http"):
+            return None
+        solution = _solve_claude_hcaptcha_yescaptcha({
+            "website_url": "https://claude.ai/magic-link",
+            "sitekey": CLAUDE_WEB_LOGIN_HCAPTCHA_SITEKEY,
+            "rqdata": "",
+            "user_agent": user_agent,
+            "is_invisible": True,
+        })
+        if not solution:
+            return None
+        session.headers.update({
+            "user-agent": solution.get("user_agent") or user_agent,
+            "content-type": "application/json",
+        })
+        response = session.post(
+            "https://claude.ai/api/auth/verify_magic_link",
+            json={
+                "credentials": {
+                    "method": "nonce",
+                    "nonce": nonce,
+                    "encoded_email_address": encoded_email,
+                },
+                "locale": "en-US",
+                "arkose_session_token": solution["token"],
+                "source": "claude",
+            },
+            timeout=30,
+        )
+        data = _claude_json_response(response) or {}
+        cookies = session.cookies.get_dict()
+        if response.status_code == 200 and cookies.get("sessionKey"):
+            print("  [magic-http] nonce verified; sessionKey received")
+            return {"cookies": cookies, "response": data}
+        error = (data.get("error") or {}).get("message") or data.get("message") or ""
+        print(f"  [magic-http] verification failed: HTTP {response.status_code} "
+              f"{str(error)[:120]}")
+    except Exception as e:
+        print(f"  [magic-http] verification error: {str(e)[:140]}")
+    finally:
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+    return None
+
+
+async def verify_claude_magic_link_http(page, magic_link):
+    verified = await asyncio.to_thread(_verify_claude_magic_link_http, magic_link)
+    if not verified:
+        return False
+    cookies = []
+    for name, value in verified["cookies"].items():
+        if not name or value is None:
+            continue
+        cookies.append({
+            "name": name,
+            "value": str(value),
+            "domain": ".claude.ai",
+            "path": "/",
+            "secure": True,
+            "sameSite": "Lax",
+        })
+    if not cookies:
+        return False
+    await page.context.add_cookies(cookies)
+    try:
+        await page.goto("https://claude.ai/", timeout=60000)
+        await asyncio.sleep(5)
+        await dismiss_claude_cookie_banner(page)
+    except Exception as e:
+        print(f"  [magic-http] session cookies installed; browser navigation warning: "
+              f"{str(e)[:120]}")
+    return True
+
+
+async def _inject_claude_hcaptcha_solution(page, solution, preferred_frame=None):
+    payload = {
+        "token": solution["token"],
+        "respKey": solution.get("resp_key") or "",
+    }
+    injected = []
+    frames = []
+    if preferred_frame is not None:
+        frames.append(preferred_frame)
+    frames.extend(frame for frame in page.frames if frame is not preferred_frame)
+    for frame in frames:
+        try:
+            result = await frame.evaluate("""(payload) => {
+                const setValue = (el, value) => {
+                    const proto = el instanceof HTMLTextAreaElement
+                        ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                    if (setter) setter.call(el, value); else el.value = value;
+                    el.innerHTML = value;
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                };
+                let fields = 0;
+                document.querySelectorAll(
+                    'textarea[name="h-captcha-response"], input[name="h-captcha-response"], '
+                    'textarea[name="g-recaptcha-response"], input[name="g-recaptcha-response"]'
+                ).forEach(el => { setValue(el, payload.token); fields++; });
+                if (payload.respKey) {
+                    document.querySelectorAll('[name="h-captcha-resp-key"]').forEach(el => {
+                        setValue(el, payload.respKey); fields++;
+                    });
+                }
+                let callbacks = 0;
+                const knownCallbacks = Array.isArray(window.__rfHcaptchaCallbacks)
+                    ? window.__rfHcaptchaCallbacks : [];
+                const uniqueCallbacks = [...new Set(knownCallbacks)];
+                if (!uniqueCallbacks.length && typeof window.__rfHcaptchaCallback === 'function') {
+                    uniqueCallbacks.push(window.__rfHcaptchaCallback);
+                }
+                for (const callback of uniqueCallbacks) {
+                    try {
+                        callback(payload.token);
+                        callbacks++;
+                    } catch (e) {}
+                }
+                window.__rfHcaptchaInjected = payload.token;
+                return {
+                    fields,
+                    callbacks,
+                    callback: callbacks > 0,
+                    hook: window.__rfHcaptchaHookLoaded === true,
+                    captures: Array.isArray(window.__rfHcaptchaCaptured)
+                        ? window.__rfHcaptchaCaptured.length : 0,
+                    wrapped: Boolean(window.hcaptcha?.render?.__rfWrapped)
+                };
+            }""", payload)
+            injected.append(result)
+        except Exception:
+            pass
+    callbacks = sum(1 for item in injected if item.get("callback"))
+    fields = sum(item.get("fields", 0) for item in injected)
+    hooks = sum(1 for item in injected if item.get("hook"))
+    captures = sum(item.get("captures", 0) for item in injected)
+    wrapped = sum(1 for item in injected if item.get("wrapped"))
+    print(f"  [yescaptcha] injected hCaptcha token (callbacks={callbacks}, fields={fields}, "
+          f"hooks={hooks}, captures={captures}, wrapped={wrapped})")
+    return callbacks > 0 or fields > 0
+
+
+async def _inject_claude_hcaptcha_solution_with_retry(page, solution, attempts=6):
+    for attempt in range(1, attempts + 1):
+        if await _inject_claude_hcaptcha_solution(page, solution):
+            return True
+        if attempt < attempts:
+            await asyncio.sleep(1)
+    return False
+
+
+async def _verify_claude_magic_link_browser_api(page, solution, magic_link=None):
+    """Verify the nonce in the browser session that submitted the email form."""
+    from urllib.parse import urlsplit
+
+    fragment = urlsplit(magic_link or page.url).fragment
+    nonce, separator, encoded_email = fragment.partition(":")
+    if not separator or not nonce or not encoded_email:
+        return False
+    template = getattr(page, "__dict__", {}).get("_rf_magic_verify_template") or {}
+    if not isinstance(template, dict):
+        template = {}
+    try:
+        request_payload = json.loads(template.get("post_data") or "{}")
+    except Exception:
+        request_payload = {}
+    if not isinstance(request_payload, dict):
+        request_payload = {}
+    request_payload["credentials"] = {
+        "method": "nonce",
+        "nonce": nonce,
+        "encoded_email_address": encoded_email,
+    }
+    if not request_payload.get("arkose_session_token"):
+        print("  [magic-browser] no native Arkose token available for replay")
+        return False
+    request_payload.setdefault("locale", "en-US")
+    existing_attestation = request_payload.get("client_attestation")
+    if isinstance(existing_attestation, str):
+        request_payload["client_attestation"] = solution["token"]
+    else:
+        attestation = dict(existing_attestation or {})
+        token_key = next(
+            (key for key in attestation if "token" in key.lower()),
+            "hcaptcha_token",
+        )
+        attestation[token_key] = solution["token"]
+        request_payload["client_attestation"] = attestation
+    request_payload.setdefault("source", "claude")
+    request_payload.pop("oauth_client_id", None)
+    captured_headers = template.get("headers") or {}
+    replay_headers = {
+        key: value for key, value in captured_headers.items()
+        if key.lower() == "content-type"
+        or key.lower().startswith("anthropic-")
+        or key.lower().startswith("x-")
+    }
+    replay_headers.setdefault("content-type", "application/json")
+    endpoint = template.get("url") or "/api/auth/verify_magic_link"
+    if template:
+        print(
+            "  [magic-browser] replaying captured Claude request "
+            f"(payload={sorted(request_payload)}, headers={sorted(replay_headers)})"
+        )
+    try:
+        page._rf_replaying_magic_verify = True
+        result = await page.evaluate("""async ({endpoint, headers, payload}) => {
+            try {
+                const response = await fetch(endpoint, {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers,
+                    body: JSON.stringify(payload)
+                });
+                let data = null;
+                try { data = await response.json(); } catch (e) {}
+                return {
+                    ok: response.ok,
+                    status: response.status,
+                    error: data?.error?.message || data?.message || ''
+                };
+            } catch (e) {
+                return {ok: false, status: 0, error: String(e)};
+            }
+        }""", {
+            "endpoint": endpoint,
+            "headers": replay_headers,
+            "payload": request_payload,
+        })
+    except Exception as e:
+        print(f"  [magic-browser] verification error: {str(e)[:120]}")
+        return False
+    finally:
+        page._rf_replaying_magic_verify = False
+    if result.get("ok"):
+        print("  [magic-browser] nonce verified in visible browser session")
+        try:
+            await page.goto("https://claude.ai/", timeout=60000)
+            await asyncio.sleep(4)
+        except Exception as e:
+            print(f"  [magic-browser] post-verify navigation warning: {str(e)[:100]}")
+        return True
+    print(f"  [magic-browser] verification failed: HTTP {result.get('status', 0)} "
+          f"{str(result.get('error') or '')[:120]}")
+    return False
+
+
+def _select_claude_vision_voter():
+    """Choose the requested Gemini model from configured agent-captcha gateways."""
+    try:
+        from common import agent_captcha
+    except Exception as e:
+        print(f"  [vision] agent-captcha unavailable: {str(e)[:100]}")
+        return None
+    desired = (CLAUDE_VISION_MODEL or "gemini-3.6-flash").strip()
+    if CLAUDE_VISION_API_BASE and CLAUDE_VISION_API_KEY:
+        return CLAUDE_VISION_API_BASE, CLAUDE_VISION_API_KEY, desired
+    gateways = (
+        (agent_captcha.ZZ_BASE, agent_captcha.ZZ_KEY),
+        (agent_captcha.VISION_API_BASE, agent_captcha.VISION_API_KEY),
+    )
+    usable_gateway = None
+    for base, key in gateways:
+        if not base or not key:
+            continue
+        if usable_gateway is None:
+            usable_gateway = (base, key)
+        try:
+            response = requests.get(
+                f"{base.rstrip('/')}/v1/models",
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=20,
+            )
+            if response.status_code != 200:
+                continue
+            available = {
+                item.get("id", "") for item in response.json().get("data", [])
+                if isinstance(item, dict)
+            }
+        except Exception:
+            continue
+        if desired in available:
+            return base, key, desired
+    if usable_gateway:
+        print(f"  [vision] using requested model {desired} through agent_captcha")
+        return usable_gateway[0], usable_gateway[1], desired
+    print("  [vision] no configured agent-captcha vision gateway")
+    return None
+
+
+async def _visible_claude_hcaptcha_frame(page, timeout=15):
+    """Wait for the native challenge canvas, ignoring hidden preload frames."""
+    deadline = time.monotonic() + max(0, timeout)
+    checkbox_clicked = False
+    challenge_debug = []
+    while time.monotonic() < deadline:
+        for frame in page.frames:
+            url = (frame.url or "").lower()
+            if "hcaptcha" not in url and "frame=challenge" not in url:
+                continue
+            try:
+                owner = await frame.frame_element()
+                owner_box = await owner.bounding_box()
+            except Exception:
+                owner_box = None
+            if "frame=challenge" in url and owner_box:
+                try:
+                    canvas = frame.locator("canvas").first
+                    canvas_box = await canvas.bounding_box() if await canvas.count() else None
+                except Exception:
+                    canvas_box = None
+                if (owner_box.get("width", 0) > 100
+                        and owner_box.get("height", 0) > 100
+                        and canvas_box and canvas_box.get("width", 0) > 100):
+                    return frame
+            if "frame=challenge" in url:
+                try:
+                    canvas_state = await frame.evaluate("""() => {
+                        const canvas = document.querySelector('canvas');
+                        return {
+                            ready: document.readyState,
+                            canvases: document.querySelectorAll('canvas').length,
+                            width: canvas?.width || 0,
+                            height: canvas?.height || 0,
+                            tasks: document.querySelectorAll('.task-image').length,
+                            submit: document.querySelectorAll('.button-submit').length,
+                            text: (document.body?.innerText || '').trim().slice(0, 80)
+                        };
+                    }""")
+                except Exception:
+                    canvas_state = {}
+                challenge_debug = [
+                    f"ready={canvas_state.get('ready', '?')}",
+                    f"canvases={canvas_state.get('canvases', 0)}",
+                    f"buffer={canvas_state.get('width', 0)}x{canvas_state.get('height', 0)}",
+                    f"tasks={canvas_state.get('tasks', 0)}",
+                    f"submit={canvas_state.get('submit', 0)}",
+                    f"owner={'visible' if owner_box else 'hidden'}",
+                    f"text={str(canvas_state.get('text', ''))[:40]!r}",
+                ]
+                if (owner_box and owner_box.get("width", 0) > 100
+                        and canvas_state.get("tasks", 0) >= 3):
+                    print("  [vision] visible DOM-tile hCaptcha challenge detected")
+                    return frame
+                if (canvas_state.get("width", 0) > 100
+                        and canvas_state.get("height", 0) > 100):
+                    try:
+                        owner = await frame.frame_element()
+                        await owner.evaluate("""iframe => {
+                            iframe.style.setProperty('display', 'block', 'important');
+                            iframe.style.setProperty('visibility', 'visible', 'important');
+                            iframe.style.setProperty('opacity', '1', 'important');
+                            iframe.style.setProperty('position', 'fixed', 'important');
+                            iframe.style.setProperty('left', 'calc(50% - 250px)', 'important');
+                            iframe.style.setProperty('top', '12px', 'important');
+                            iframe.style.setProperty('width', '500px', 'important');
+                            iframe.style.setProperty('height', '600px', 'important');
+                            iframe.style.setProperty('z-index', '2147483647', 'important');
+                            iframe.style.setProperty('pointer-events', 'auto', 'important');
+                        }""")
+                        await asyncio.sleep(0.5)
+                        canvas = frame.locator("canvas").first
+                        canvas_box = await canvas.bounding_box()
+                        if canvas_box and canvas_box.get("width", 0) > 100:
+                            print("  [vision] revealed a rendered hidden hCaptcha challenge")
+                            return frame
+                    except Exception:
+                        pass
+            if not checkbox_clicked and "frame=checkbox" in url:
+                try:
+                    checkbox = frame.locator('#checkbox, [role="checkbox"]').first
+                    if await checkbox.count():
+                        await checkbox.click(timeout=3000, force=True)
+                    else:
+                        await frame.locator("body").click(timeout=3000, force=True)
+                    checkbox_clicked = True
+                    print("  [vision] triggered the invisible hCaptcha widget")
+                except Exception:
+                    try:
+                        checkbox_clicked = bool(await frame.evaluate("""() => {
+                            const target = document.querySelector('#checkbox, [role="checkbox"]');
+                            if (!target) return false;
+                            target.click();
+                            return true;
+                        }"""))
+                        if checkbox_clicked:
+                            print("  [vision] triggered the invisible hCaptcha widget")
+                    except Exception:
+                        pass
+        await asyncio.sleep(0.5)
+    if challenge_debug:
+        print(f"  [vision] hCaptcha challenge state: {' '.join(challenge_debug)}")
+    return None
+
+
+async def dismiss_claude_cookie_banner(page):
+    """Dismiss Claude's cookie banner, preferring non-essential rejection."""
+    selectors = (
+        ("#onetrust-reject-all-handler", "reject-selector"),
+        ("#onetrust-accept-btn-handler", "accept-selector"),
+    )
+    for selector, label in selectors:
+        try:
+            button = page.locator(selector).first
+            if await button.count() and await button.is_visible():
+                await button.click(timeout=3000)
+                print(f"  [cookie] Claude dismissed: {label}")
+                await asyncio.sleep(0.5)
+                return label
+        except Exception:
+            pass
+
+    for label in CLAUDE_COOKIE_REJECT_LABELS + CLAUDE_COOKIE_ACCEPT_LABELS:
+        try:
+            button = page.get_by_role("button", name=label, exact=True).first
+            if await button.count() and await button.is_visible():
+                await button.click(timeout=3000)
+                print(f"  [cookie] Claude dismissed: {label}")
+                await asyncio.sleep(0.5)
+                return label
+        except Exception:
+            pass
+    return None
+
+
+async def _solve_claude_hcaptcha_vision(page):
+    """Solve Claude hCaptcha through its native UI and agent-captcha backend."""
+    await dismiss_claude_cookie_banner(page)
+    challenge_frame = await _visible_claude_hcaptcha_frame(page)
+    if challenge_frame is None:
+        print("  [vision] hCaptcha frame is present but its challenge canvas is not visible")
+        try:
+            await page.screenshot(
+                path="screenshots/claude_hcaptcha_no_visual.png", full_page=True
+            )
+        except Exception:
+            pass
+        return None
+    voter = await asyncio.to_thread(_select_claude_vision_voter)
+    if not voter:
+        return False
+    try:
+        from vision_solver import CaptchaSpec, solve as solve_vision_captcha
+        from vision_solver import vision as vision_backend
+    except Exception as e:
+        print(f"  [vision] hCaptcha driver unavailable: {str(e)[:100]}")
+        return False
+    preset = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "vision_solver", "presets", "hcaptcha.json",
+    )
+    spec = CaptchaSpec.from_json(preset)
+    try:
+        instruction = (
+            await challenge_frame.locator(
+                "#prompt-question, .prompt-text"
+            ).first.inner_text()
+        ).strip().lower()
+    except Exception:
+        instruction = ""
+    try:
+        dom_tile_count = await challenge_frame.locator(".task-image").count()
+    except Exception:
+        dom_tile_count = 0
+    clarified_grid_prompt = _claude_hcaptcha_grid_prompt(instruction)
+    if dom_tile_count >= 3:
+        spec.mode = "grid_select"
+        spec.tile_sel = ".task-image"
+        spec.grid_image_sel = ""
+        spec.prompt = clarified_grid_prompt
+        print(f"  [vision] DOM-tile hCaptcha detected ({dom_tile_count} tiles)")
+    elif any(marker in instruction for marker in CLAUDE_HCAPTCHA_DRAG_MARKERS):
+        spec.mode = "canvas_drag"
+        spec.prompt = ""
+        print("  [vision] drag-and-drop hCaptcha detected")
+    elif clarified_grid_prompt:
+        spec.prompt = clarified_grid_prompt
+        spec.answer_max_tokens = 100
+        spec.deadline = max(spec.deadline, 110)
+        if any(
+            marker in instruction
+            for marker in CLAUDE_HCAPTCHA_SHORTEST_CHAIN_MARKERS
+        ):
+            spec.answer_format = "SHORTEST_BEAD_CHAINS"
+        elif any(
+            marker in instruction
+            for marker in (
+                CLAUDE_HCAPTCHA_SHORTEST_LINE_MARKERS
+                + CLAUDE_HCAPTCHA_LONGEST_LINE_MARKERS
+            )
+        ):
+            spec.answer_format = "TWO_POINTS"
+        print("  [vision] clarified recurring Claude grid challenge")
+    voter_pool = [voter]
+    length_comparison_challenge = any(
+        marker in instruction
+        for marker in (
+            CLAUDE_HCAPTCHA_SHORTEST_CHAIN_MARKERS
+            + CLAUDE_HCAPTCHA_LONGEST_CHAIN_MARKERS
+            + CLAUDE_HCAPTCHA_SHORTEST_LINE_MARKERS
+            + CLAUDE_HCAPTCHA_LONGEST_LINE_MARKERS
+        )
+    )
+    primary_model = (vision_backend.PRIMARY_MODEL or "").strip()
+    if length_comparison_challenge and primary_model and primary_model != voter[2]:
+        voter_pool.insert(0, (voter[0], voter[1], primary_model))
+    if length_comparison_challenge and primary_model:
+        seen_voters = {(base, model) for base, _key, model in voter_pool}
+        for candidate in vision_backend.VOTER_MODELS:
+            base, key, model = candidate
+            identity = (base, model)
+            if (
+                key
+                and model == primary_model
+                and identity not in seen_voters
+            ):
+                voter_pool.append(candidate)
+                seen_voters.add(identity)
+    previous_voters = vision_backend.VOTER_MODELS
+    previous_primary = vision_backend.PRIMARY_MODEL
+    vision_backend.VOTER_MODELS = voter_pool
+    vision_backend.PRIMARY_MODEL = voter_pool[0][2]
+    print(
+        "  [vision] solving Claude hCaptcha with "
+        + ", ".join(candidate[2] for candidate in voter_pool)
+    )
+    try:
+        solved = await solve_vision_captcha(
+            page, spec, shot_dir="screenshots_vision/claude"
+        )
+    finally:
+        vision_backend.VOTER_MODELS = previous_voters
+        vision_backend.PRIMARY_MODEL = previous_primary
+    if solved:
+        print("  [vision] Claude hCaptcha completed through native UI")
+        await asyncio.sleep(4)
+    return bool(solved)
+
+
+async def solve_claude_hcaptcha(page, manual_timeout=None):
+    if not await _claude_hcaptcha_present(page):
+        return True
+    print("  [hcaptcha] Claude hCaptcha frame detected")
+    frame_urls = [
+        (frame.url or "")[:160]
+        for frame in page.frames
+        if _is_hcaptcha_frame_url(frame.url)
+    ]
+    if frame_urls:
+        print(f"  [hcaptcha] frames: {' | '.join(frame_urls)}")
+    os.makedirs("screenshots", exist_ok=True)
+    await page.screenshot(path="screenshots/claude_hcaptcha_detected.png", full_page=True)
+
+    vision_result = await _solve_claude_hcaptcha_vision(page)
+    if vision_result:
+        return True
+    if vision_result is None:
+        # hCaptcha keeps hidden preload frames around. Let the magic-link state
+        # loop wait for either a real challenge canvas or an authenticated route.
+        return None
+    print("  [hcaptcha] agent_captcha visual solve unavailable")
+
+    timeout = CLAUDE_CAPTCHA_MANUAL_TIMEOUT if manual_timeout is None else manual_timeout
+    if timeout > 0:
+        print(f"  [hcaptcha] manual handoff for {timeout}s")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not await _claude_hcaptcha_present(page):
+                print("  [hcaptcha] manual verification completed")
+                return True
+            await asyncio.sleep(2)
+    return False
+
+
+async def verify_claude_magic_link_with_browser_token(page, magic_link=None):
+    """Verify the pending nonce in its original browser session."""
+    params = await _extract_claude_hcaptcha_params(page, magic_link=magic_link)
+    if not params.get("sitekey") or not params.get("callback_count"):
+        return False
+    print(
+        f"  [magic-browser] token fallback sitekey={params['sitekey']} "
+        f"rqdata={'yes' if params.get('rqdata') else 'no'}"
+    )
+    solution = await asyncio.to_thread(_solve_claude_hcaptcha_yescaptcha, params)
+    if solution and await _inject_claude_hcaptcha_solution_with_retry(page, solution):
+        await asyncio.sleep(5)
+        cookies = await page.context.cookies()
+        if any(c.get("name") == "sessionKey" and c.get("value") for c in cookies):
+            return True
+    return bool(
+        solution
+        and await _verify_claude_magic_link_browser_api(
+            page, solution, magic_link=magic_link
+        )
+    )
+
+
+async def _install_claude_hcaptcha_hook(page):
+    """Install the callback hook only for the upcoming magic-link document."""
+    context = page.context
+    listener_installed = bool(
+        getattr(page, "__dict__", {}).get("_rf_magic_verify_listener_installed")
+    )
+    if not listener_installed:
+        def capture_verify_request(request):
+            if "/api/auth/verify_magic_link" not in (request.url or ""):
+                return
+            if getattr(page, "__dict__", {}).get("_rf_replaying_magic_verify"):
+                return
+            page._rf_magic_verify_template = {
+                "url": request.url,
+                "headers": dict(request.headers or {}),
+                "post_data": request.post_data or "",
+            }
+            try:
+                body = json.loads(request.post_data or "{}")
+            except Exception:
+                body = {}
+            schema = {}
+            for key, value in (body.items() if isinstance(body, dict) else ()):
+                if isinstance(value, dict):
+                    nested = []
+                    for nested_key, nested_value in sorted(value.items()):
+                        if isinstance(nested_value, str):
+                            nested.append(
+                                f"{nested_key}:string(len={len(nested_value)})"
+                            )
+                        else:
+                            nested.append(
+                                f"{nested_key}:{type(nested_value).__name__}"
+                            )
+                    schema[key] = f"object({nested})"
+                elif isinstance(value, str):
+                    schema[key] = f"string(len={len(value)})"
+                elif value is None:
+                    schema[key] = "null"
+                else:
+                    schema[key] = type(value).__name__
+            print(
+                "  [magic-browser] captured Claude verify request template "
+                f"schema={schema}"
+            )
+
+        async def capture_verify_response(response):
+            if "/api/auth/verify_magic_link" not in (response.url or ""):
+                return
+            if getattr(page, "__dict__", {}).get("_rf_replaying_magic_verify"):
+                return
+            try:
+                body = (await response.text()).replace("\n", " ")[:240]
+            except Exception:
+                body = ""
+            try:
+                all_headers = await response.all_headers()
+            except Exception:
+                all_headers = {}
+            diagnostic_headers = {
+                key: all_headers[key]
+                for key in (
+                    "server", "content-type", "cf-ray", "cf-mitigated",
+                    "cf-cache-status", "x-request-id",
+                )
+                if all_headers.get(key)
+            }
+            page._rf_magic_verify_status = response.status
+            page._rf_magic_verify_response_body = body
+            page._rf_magic_verify_response_headers = diagnostic_headers
+            print(
+                f"  [magic-browser] native verify response HTTP {response.status} "
+                f"body={body!r} headers={diagnostic_headers}"
+            )
+
+        page.on("request", capture_verify_request)
+        page.on("response", capture_verify_response)
+        page._rf_magic_verify_listener_installed = True
+    try:
+        await page.add_init_script(HCAPTCHA_HOOK_JS)
+    except Exception as e:
+        print(f"  hCaptcha page init hook warning: {str(e)[:100]}")
+    try:
+        cdp = await context.new_cdp_session(page)
+        await cdp.send(
+            "Page.addScriptToEvaluateOnNewDocument", {"source": HCAPTCHA_HOOK_JS}
+        )
+        try:
+            await cdp.detach()
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"  hCaptcha CDP hook warning: {str(e)[:100]}")
+    await context.add_init_script(HCAPTCHA_HOOK_JS)
+    try:
+        # Claude may handle /magic-link as a same-document SPA route, in which
+        # case init scripts never fire. Email submission is already complete,
+        # so installing on the current page cannot affect the send request.
+        await page.evaluate(f"() => {{{HCAPTCHA_HOOK_JS}}}")
+    except Exception as e:
+        print(f"  hCaptcha current-page hook warning: {str(e)[:100]}")
+    print("  hCaptcha hook armed for magic-link page")
+
+
+async def open_claude_magic_link(page, magic_link):
+    """Arm hCaptcha capture before loading the magic-link document."""
+    await _install_claude_hcaptcha_hook(page)
+    try:
+        await page.goto(magic_link, timeout=60000)
+    except Exception:
+        await page.evaluate("(url) => { window.location.href = url; }", magic_link)
+        await page.wait_for_load_state("domcontentloaded", timeout=60000)
+    await asyncio.sleep(1)
+    try:
+        hook_state = await page.evaluate("""() => ({
+            loaded: window.__rfHcaptchaHookLoaded === true,
+            captures: (window.__rfHcaptchaCaptured || []).length,
+            wrapped: Boolean(window.hcaptcha?.render?.__rfWrapped)
+        })""")
+        print(
+            "  hCaptcha hook state after navigation: "
+            f"loaded={hook_state.get('loaded')} "
+            f"captures={hook_state.get('captures')} "
+            f"wrapped={hook_state.get('wrapped')}"
+        )
+    except Exception as e:
+        print(f"  hCaptcha post-navigation hook warning: {str(e)[:100]}")
+    await asyncio.sleep(4)
+
+
+def _native_claude_magic_verify_succeeded(page):
+    status = getattr(page, "_rf_magic_verify_status", None)
+    body = str(getattr(page, "_rf_magic_verify_response_body", "") or "")
+    compact_body = "".join(body.lower().split())
+    return (
+        isinstance(status, int)
+        and 200 <= status < 300
+        and '"success":true' in compact_body
+    )
+
+
+async def _finish_native_claude_magic_verify(page):
+    if not _native_claude_magic_verify_succeeded(page):
+        return False
+    print("  [magic-browser] native magic-link verification succeeded")
+    try:
+        await page.goto("https://claude.ai/", timeout=60000)
+        await asyncio.sleep(3)
+    except Exception as error:
+        print(
+            "  [magic-browser] post-verify navigation warning: "
+            f"{str(error)[:100]}"
+        )
+    return True
+
+
+async def prepare_claude_post_magic(page, max_wait=25):
+    loading_markers = ("loading", "로딩 중", "読み込み中", "加载中", "載入中")
+    expired_markers = (
+        "link has expired", "link is expired", "expired link",
+        "이 링크는 만료", "リンクの有効期限", "链接已过期", "連結已過期",
+        "lien a expiré", "enlace ha caducado", "link ist abgelaufen",
+    )
+    deadline = time.monotonic() + max_wait
+    while time.monotonic() < deadline:
+        if await _finish_native_claude_magic_verify(page):
+            return True
+        native_status = getattr(page, "_rf_magic_verify_status", None)
+        if native_status == 403:
+            raise ClaudeChallengeError(
+                "Claude native magic-link verification rejected HTTP 403"
+            )
+        if await _claude_hcaptcha_present(page):
+            solved = await solve_claude_hcaptcha(page)
+            if solved is None:
+                await asyncio.sleep(1)
+                continue
+            if not solved:
+                raise ClaudeChallengeError("Claude hCaptcha was not solved")
+            # Captcha solving may itself run past max_wait. Check the native
+            # verification result before the loop deadline can hide it behind
+            # a generic loading-state error.
+            native_status = getattr(page, "_rf_magic_verify_status", None)
+            if native_status == 403:
+                raise ClaudeChallengeError(
+                    "Claude native magic-link verification rejected HTTP 403"
+                )
+            if await _finish_native_claude_magic_verify(page):
+                return True
+            # The iframe can disappear while Claude is still processing an
+            # invalid answer. The resulting session or form is authoritative.
+            await asyncio.sleep(1)
+            continue
+        try:
+            text = (await page.locator("body").inner_text(timeout=2000)).lower()
+        except Exception:
+            text = ""
+        if any(marker in text for marker in expired_markers):
+            raise ClaudeChallengeError("Claude magic link expired before verification")
+        path = page.url.split("#", 1)[0]
+        if any(route in path for route in ("/chat", "/new", "/onboarding", "/settings")):
+            return True
+        try:
+            visible_fields = await page.locator(
+                'input:not([type="hidden"]), select, button[type="submit"]'
+            ).count()
+        except Exception:
+            visible_fields = 0
+        if visible_fields and not any(marker in text for marker in loading_markers):
+            return True
+        await asyncio.sleep(1)
+    raise ClaudeChallengeError("Claude magic-link page stayed in loading state")
+
+
+async def prepare_claude_post_magic_with_http_fallback(page, magic_link, max_wait=25):
+    """Recover a browser magic-link spinner through nonce verification over HTTP."""
+    try:
+        return await prepare_claude_post_magic(page, max_wait=max_wait)
+    except ClaudeChallengeError as error:
+        native_headers = getattr(
+            page, "_rf_magic_verify_response_headers", {}
+        ) or {}
+        native_cf_block = (
+            "native magic-link verification rejected HTTP 403" in str(error)
+            and native_headers.get("cf-mitigated") == "challenge"
+        )
+        already_reloaded = bool(
+            getattr(page, "__dict__", {}).get(
+                "_rf_native_cf_reload_attempted", False
+            )
+        )
+        if native_cf_block and not already_reloaded:
+            page._rf_native_cf_reload_attempted = True
+            page._rf_magic_verify_status = None
+            page._rf_magic_verify_response_body = ""
+            page._rf_magic_verify_response_headers = {}
+            print(
+                "  [magic-browser] native verify hit a Cloudflare challenge; "
+                "reloading the magic link once"
+            )
+            await open_claude_magic_link(page, magic_link)
+            return await prepare_claude_post_magic(
+                page, max_wait=max(max_wait, 45)
+            )
+        recoverable = (
+            "stayed in loading state",
+            "hCaptcha was not solved",
+        )
+        if not any(marker in str(error) for marker in recoverable):
+            raise
+        print(
+            "  [magic-http] browser magic-link verification incomplete; "
+            "trying token verification in the pending browser session"
+        )
+        if getattr(page, "__dict__", {}).get("_rf_visible_email_submitted"):
+            print(
+                "  [magic-http] pending browser session requires native visual "
+                "client attestation; skipping incompatible HTTP fallback"
+            )
+            raise
+        if await verify_claude_magic_link_with_browser_token(page, magic_link):
+            return True
+        print("  [magic-http] browser token fallback failed; trying HTTP nonce verification")
+        if await verify_claude_magic_link_http(page, magic_link):
+            return True
+        raise
 
 
 async def handle_birthday_page(page, birth_year, birth_month, birth_day):
     """Detect and fill birthday page. Returns True if birthday page was found."""
     page_text = await page.evaluate("() => document.body.innerText.toLowerCase()")
-    has_birthday = any(k in page_text for k in ['birthday', 'date of birth', 'birth date'])
+    birthday_markers = (
+        'birthday', 'date of birth', 'birth date',
+        '생년월일', '생일', '生年月日', '誕生日', '出生日期', '生日',
+        'date de naissance', 'fecha de nacimiento', 'fecha de cumpleaños',
+        'geburtsdatum', 'data de nascimento', 'data di nascita', 'geboortedatum',
+    )
+    has_birthday = any(k in page_text for k in birthday_markers)
     if not has_birthday:
         return False
 
@@ -2323,6 +4039,7 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
 
     for round_i in range(max_rounds):
         await asyncio.sleep(2)
+        await dismiss_claude_cookie_banner(page)
 
         # 检测是否被 logout（排除 returnTo=onboarding 的情况）
         current_url = page.url.lower()
@@ -3136,6 +4853,25 @@ async def _get_and_verify_phone(page, max_attempts=2):
     return False
 
 
+async def _open_bitbrowser_with_retry(bb, profile_id, attempts=8):
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            return bb.open_browser(profile_id)
+        except Exception as e:
+            last_error = e
+            message = str(e).lower()
+            retryable = any(marker in message for marker in (
+                "正在打开", "opening", "启动中", "starting", "busy",
+                "tls", "socket", "disconnected", "connection", "timed out", "timeout",
+            ))
+            if not retryable or attempt >= attempts - 1:
+                raise
+            print(f"  BitBrowser still opening; retry {attempt + 1}/{attempts}")
+            await asyncio.sleep(2)
+    raise last_error
+
+
 async def register(profile_id, email="", email_password="", email_token="", email_client_id=""):
     """Run one registration. Returns sessionKey on success, None on failure."""
     bb = BitBrowser()
@@ -3147,7 +4883,7 @@ async def register(profile_id, email="", email_password="", email_token="", emai
             raise TimeoutError(f"registration timeout ({REGISTER_TIMEOUT}s)")
 
     print(f"\n[1/6] open BitBrowser...")
-    browser_data = bb.open_browser(profile_id)
+    browser_data = await _open_bitbrowser_with_retry(bb, profile_id)
     ws_url = browser_data["ws"]
     print(f"  ws: {ws_url}")
 
@@ -3258,14 +4994,11 @@ async def register(profile_id, email="", email_password="", email_token="", emai
                     });
                 }
             """
-            # 通过 CDP 在每个 frame 创建时自动注入（比 add_init_script 更早）
-            cdp = await context.new_cdp_session(page)
-            await cdp.send("Page.addScriptToEvaluateOnNewDocument", {"source": stealth_js})
-            # 也在当前页面执行一次
-            await page.evaluate(f"() => {{{stealth_js}}}")
-            # add_init_script 作为备份
-            await context.add_init_script(f"() => {{{stealth_js}}}")
-            print("  stealth injected (CDP + init_script)")
+            # BitBrowser already supplies a coherent browser fingerprint.
+            # Preloading stealth/hCaptcha patches on /login makes Claude's API
+            # return 403, so arm only the hCaptcha hook immediately before the
+            # magic-link navigation below.
+            print("  using native BitBrowser fingerprint on Claude login")
 
             # 清掉旧的 pre-save 文件，避免误用
             import glob as _glob
@@ -3304,39 +5037,32 @@ async def register(profile_id, email="", email_password="", email_token="", emai
                 await page.wait_for_load_state("load", timeout=15000)
             except Exception:
                 pass
-            await page.goto(CLAUDE_LOGIN_URL, timeout=60000)
-            await asyncio.sleep(5)
+            login_loaded = False
+            for goto_attempt in range(3):
+                try:
+                    await page.goto(CLAUDE_LOGIN_URL, timeout=60000)
+                    login_loaded = True
+                    break
+                except Exception as e:
+                    print(f"  Claude login navigation retry {goto_attempt + 1}/3: "
+                          f"{str(e)[:120]}")
+                    await asyncio.sleep(3 + goto_attempt)
+            if login_loaded:
+                await asyncio.sleep(5)
+            else:
+                print("  Claude login page unavailable; continuing with HTTP magic-link flow")
             print(f"  URL: {page.url}")
 
-            # solve Cloudflare Turnstile
-            await solve_turnstile(page, max_wait=60)
-            check_timeout()
-
-            # 确认登录表单真的出现（Turnstile 可能"假性通过"——iframe 没加载就被判通过，
-            # 此时邮箱框/按钮根本不在，硬填会卡 30s 超时）。表单没出现就 reload 重解，最多 3 次。
-            EMAIL_SEL = 'input[type="email"], input[name="email"], input[id="email"]'
-            for cf_attempt in range(3):
-                try:
-                    await page.wait_for_selector(EMAIL_SEL, state="visible", timeout=15000)
-                    break
-                except Exception:
-                    print(f"  [cf] login form not ready (likely false-pass), reload+resolve (attempt {cf_attempt+1}/3)")
-                    try:
-                        await page.goto(CLAUDE_LOGIN_URL, timeout=60000)
-                        await asyncio.sleep(5)
-                        await solve_turnstile(page, max_wait=60)
-                    except Exception:
-                        pass
-                    check_timeout()
-
-            # enter email
+            # Enter and submit email only after the login page is stable. Claude
+            # can redirect to another challenge after the first field appears.
             print(f"  email: {email}")
-            await human_type(page, 'input[type="email"], input[name="email"], input[id="email"]', email)
-            await asyncio.sleep(1)
-
-            magic_requested_at = time.time()
-            if not await click_continue_email(page):
-                print("  [warn] continue-email button not found in any language")
+            magic_requested_at = await submit_claude_email(
+                page, email, allow_node_rotation=True, attempts=2
+            )
+            if not magic_requested_at:
+                raise ClaudeChallengeError(
+                    "Claude email form could not be submitted after verification"
+                )
             check_timeout()
 
             # poll magic link from outlook inbox
@@ -3366,12 +5092,16 @@ async def register(profile_id, email="", email_password="", email_token="", emai
                 try:
                     await page.goto(CLAUDE_LOGIN_URL, timeout=30000)
                     await asyncio.sleep(5)
-                    await solve_turnstile(page, max_wait=30)
-                    await human_type(page, 'input[type="email"], input[name="email"], input[id="email"]', email)
-                    await asyncio.sleep(1)
-                    magic_requested_at = time.time()
-                    await click_continue_email(page)
+                    magic_requested_at = await submit_claude_email(
+                        page, email, allow_node_rotation=True, attempts=2
+                    )
+                    if not magic_requested_at:
+                        raise ClaudeChallengeError(
+                            "Claude verification blocked magic-link resend"
+                        )
                     print("  resent magic link")
+                except ClaudeChallengeError:
+                    raise
                 except Exception as e:
                     print(f"  resend error: {e}")
                 await asyncio.sleep(3)
@@ -3393,15 +5123,22 @@ async def register(profile_id, email="", email_password="", email_token="", emai
             if outlook_page:
                 await outlook_page.close()
             print(f"  link: {magic_link[:80]}...")
-            # open magic link
-            try:
-                await page.goto(magic_link, timeout=60000)
-            except Exception:
-                await page.evaluate(f"window.location.href = `{magic_link}`")
-                await page.wait_for_load_state("domcontentloaded", timeout=60000)
-            await asyncio.sleep(5)
+            # Prefer direct nonce verification. Browser-side verification can
+            # remain on a Cloudflare loading page before hCaptcha even renders.
+            has_browser_login_state = bool(
+                getattr(page, "_rf_visible_email_submitted", False)
+            )
+            verified_over_http = False
+            if not has_browser_login_state:
+                verified_over_http = await verify_claude_magic_link_http(
+                    page, magic_link
+                )
+            if not verified_over_http:
+                await open_claude_magic_link(page, magic_link)
             print(f"  URL: {page.url}")
 
+            check_timeout()
+            await prepare_claude_post_magic_with_http_fallback(page, magic_link)
             check_timeout()
 
             # registration form
@@ -3558,10 +5295,24 @@ async def register(profile_id, email="", email_password="", email_token="", emai
                 or 'enter your phone' in page_text
                 or await page.locator('input[type="tel"]').count() > 0
             )
-            is_logged_in = any(k in current_url for k in ['/chat', '/new', '/settings'])
-            print(f"  needs_phone={needs_phone}, logged_in={is_logged_in}")
+            cookies = await context.cookies()
+            has_session_key = any(
+                c.get("name") == "sessionKey" and c.get("value") for c in cookies
+            )
+            is_logged_in = any(
+                k in current_url for k in ['/chat', '/new', '/settings', '/onboarding']
+            )
+            authenticated = is_logged_in or has_session_key
+            print(
+                f"  needs_phone={needs_phone}, logged_in={is_logged_in}, "
+                f"sessionKey={has_session_key}"
+            )
             print(f"  page preview: {page_text[:100]}")
 
+            if not needs_phone and not authenticated:
+                raise ClaudeChallengeError(
+                    "Claude magic-link flow did not create an authenticated session"
+                )
             if not needs_phone:
                 print("\n  no phone needed, skipping to onboarding!")
             elif is_logged_in:
@@ -3715,9 +5466,10 @@ async def register(profile_id, email="", email_password="", email_token="", emai
                         # 重新登录
                         await page.goto(CLAUDE_LOGIN_URL, timeout=30000)
                         await asyncio.sleep(5)
-                        await solve_turnstile(page, max_wait=30)
+                        if not await ensure_claude_login_form(page, allow_node_rotation=False):
+                            raise ClaudeChallengeError("Claude verification blocked re-login")
                         print(f"  re-login email: {email}")
-                        await human_type(page, 'input[type="email"], input[name="email"], input[id="email"]', email)
+                        await human_type(page, CLAUDE_EMAIL_SELECTOR, email)
                         await asyncio.sleep(1)
                         await click_continue_email(page)
                         print("  clicked continue")
@@ -3750,6 +5502,8 @@ async def register(profile_id, email="", email_password="", email_token="", emai
                         except Exception:
                             pass
                         continue  # 重试 onboarding
+                    except ClaudeChallengeError:
+                        raise
                     except Exception as e:
                         print(f"  re-login error: {e}")
                         break
@@ -3785,6 +5539,10 @@ async def register(profile_id, email="", email_password="", email_token="", emai
                 print("  no sessionKey in cookies")
                 mark_email_error(email, email_password, "no_session_key")
 
+    except ClaudeChallengeError as e:
+        print(f"\n  CLAUDE CHALLENGE: {e}")
+        if email:
+            print(f"  mailbox retained for retry: {email}")
     except TimeoutError as e:
         print(f"\n  TIMEOUT: {e}")
         if email:
@@ -3811,6 +5569,10 @@ async def register(profile_id, email="", email_password="", email_token="", emai
 
 
 async def main():
+    global REGISTER_TIMEOUT, CLAUDE_PROXY_NODE, CLAUDE_PROXY_PORT, CLAUDE_PROXY_AUTO
+    global CLAUDE_CHALLENGE_WAIT_SECONDS, CLAUDE_CHALLENGE_NODE_RETRIES
+    global CLAUDE_CAPTCHA_MANUAL_TIMEOUT
+
     parser = argparse.ArgumentParser(description="Claude.ai Auto Register")
     parser.add_argument("--count", "-n", type=int, default=1, help="number of accounts to register")
     parser.add_argument("--timeout", "-t", type=int, default=480, help="timeout per registration (seconds)")
@@ -3822,14 +5584,33 @@ async def main():
     parser.add_argument("--client-id", type=str, default="", help=argparse.SUPPRESS)
     parser.add_argument("--latest-rt", action="store_true",
                         help="use newest unused Outlook accounts with working Graph RT")
-    parser.add_argument("--node", type=str, default="none",
+    parser.add_argument("--node", type=str, default="auto",
                         help="Clash 出口节点绕 claude 区域封锁：none=不走代理 / auto=自动探测 / 具体节点名")
     parser.add_argument("--proxy-port", type=str, default="7897", help="Clash mixed-port 代理端口")
+    parser.add_argument(
+        "--challenge-wait", type=int, default=CLAUDE_CHALLENGE_WAIT_SECONDS,
+        help="seconds to wait for Cloudflare on each node",
+    )
+    parser.add_argument(
+        "--challenge-node-retries", type=int, default=CLAUDE_CHALLENGE_NODE_RETRIES,
+        help="node rotations before email submission when --node auto",
+    )
+    parser.add_argument(
+        "--captcha-manual-timeout", type=int, default=CLAUDE_CAPTCHA_MANUAL_TIMEOUT,
+        help="seconds to wait for manual verification in BitBrowser; 0 disables",
+    )
     args = parser.parse_args()
 
-    global REGISTER_TIMEOUT, CLAUDE_PROXY_NODE, CLAUDE_PROXY_PORT
     REGISTER_TIMEOUT = args.timeout
     CLAUDE_PROXY_PORT = args.proxy_port
+    CLAUDE_PROXY_AUTO = bool(args.node and args.node.lower() == "auto")
+    CLAUDE_CHALLENGE_WAIT_SECONDS = max(0, args.challenge_wait)
+    CLAUDE_CHALLENGE_NODE_RETRIES = max(0, args.challenge_node_retries)
+    CLAUDE_CAPTCHA_MANUAL_TIMEOUT = max(0, args.captcha_manual_timeout)
+
+    if CLAUDE_PROXY_AUTO and args.concurrency > 1:
+        print("  [proxy] --node auto uses a global Clash route; forcing concurrency=1")
+        args.concurrency = 1
 
     # 选 Clash 节点过 claude 区域封锁（app-unavailable-in-region）
     if args.node and args.node.lower() != "none":
@@ -3841,7 +5622,7 @@ async def main():
                     print("  [proxy] 自动探测能进 claude 的节点(轮换避开最近用过的)...")
                     node = _pick_claude_node()
                     if not node:
-                        print("  [proxy] 没找到能进 claude 的节点，仍按无代理继续(大概率失败)")
+                        print("  [proxy] 启动预检未命中，浏览器仍走 Clash 并在验证页继续轮换")
                     else:
                         CLAUDE_PROXY_NODE = node
                         _record_claude_node(node)
@@ -3930,7 +5711,10 @@ async def main():
             profile_id = None
             for _retry in range(3):
                 try:
-                    profile_id = bb.create_browser(name=name)
+                    profile_id = bb.create_browser(
+                        name=name,
+                        browserFingerPrint=claude_browser_fingerprint(),
+                    )
                     break
                 except Exception as e:
                     err_msg = str(e)
@@ -3949,16 +5733,27 @@ async def main():
                     results.append({"index": i, "profile": name, "status": "ERROR", "sk": None})
                 return
             # 走 Clash 节点：更新窗口为 http 代理（绕 claude 区域封锁）
-            if CLAUDE_PROXY_NODE:
-                try:
-                    bb._post("/browser/update", {
-                        "id": profile_id, "name": name, "proxyMethod": 2, "proxyType": "http",
-                        "host": CLAUDE_PROXY_HOST, "port": CLAUDE_PROXY_PORT,
-                        "browserFingerPrint": {"coreVersion": "130"},
-                    })
-                    print(f"  [proxy] window via {CLAUDE_PROXY_HOST}:{CLAUDE_PROXY_PORT} (node={CLAUDE_PROXY_NODE})")
-                except Exception as e:
-                    print(f"  [proxy] window update failed: {e}")
+            if CLAUDE_PROXY_NODE or CLAUDE_PROXY_AUTO:
+                proxy_update_error = None
+                for update_attempt in range(3):
+                    try:
+                        bb._post("/browser/update", {
+                            "id": profile_id, "name": name, "proxyMethod": 2,
+                            "proxyType": "http", "host": CLAUDE_PROXY_HOST,
+                            "port": CLAUDE_PROXY_PORT,
+                            "browserFingerPrint": claude_browser_fingerprint(),
+                        })
+                        proxy_update_error = None
+                        print(f"  [proxy] window via {CLAUDE_PROXY_HOST}:{CLAUDE_PROXY_PORT} "
+                              f"(node={CLAUDE_PROXY_NODE or 'pending-auto'})")
+                        break
+                    except Exception as e:
+                        proxy_update_error = e
+                        print(f"  [proxy] window update retry {update_attempt + 1}/3: "
+                              f"{str(e)[:100]}")
+                        await asyncio.sleep(2 + update_attempt)
+                if proxy_update_error is not None:
+                    raise proxy_update_error
             try:
                 sk = await register(
                     profile_id, email, email_password, email_token, email_client_id
@@ -3967,6 +5762,16 @@ async def main():
                     results.append({"index": i, "profile": name, "status": "OK" if sk else "FAIL", "sk": sk})
             except Exception as e:
                 print(f"  FATAL: {e}")
+                if profile_id:
+                    try:
+                        bb.close_browser(profile_id)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(2)
+                    try:
+                        bb.delete_browser(profile_id)
+                    except Exception:
+                        pass
                 async with results_lock:
                     results.append({"index": i, "profile": name, "status": "ERROR", "sk": None})
 

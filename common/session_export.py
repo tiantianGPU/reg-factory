@@ -378,7 +378,10 @@ async def fetch_chatgpt_session(page):
     """页面在 chatgpt.com 时抓 /api/auth/session。返回含 accessToken 的 dict,否则 None。"""
     try:
         result = await page.evaluate(
-            "() => fetch('/api/auth/session', {credentials: 'include'})"
+            "() => fetch('/api/auth/session?ts=' + Date.now(), {"
+            "credentials: 'include', cache: 'no-store', "
+            "headers: {'cache-control': 'no-cache', pragma: 'no-cache'}"
+            "})"
             ".then(r => r.ok ? r.json() : null).catch(() => null)"
         )
     except Exception:

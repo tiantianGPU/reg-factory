@@ -7,6 +7,7 @@ import asyncio
 import sys
 import os
 from datetime import datetime
+from urllib.parse import urlparse
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -19,12 +20,53 @@ OUTPUT_VALID = INPUT_FILE.replace(".txt", "_valid.txt")
 OUTPUT_INVALID = INPUT_FILE.replace(".txt", "_invalid.txt")
 
 
+def validation_browser_options():
+    options = {
+        "browserFingerPrint": {
+            "coreVersion": os.environ.get(
+                "CLAUDE_BROWSER_CORE_VERSION",
+                os.environ.get("BB_CORE_VERSION", "146"),
+            ),
+            "isIpCreateTimeZone": True,
+            "isIpCreateLanguage": True,
+            "isIpCreateDisplayLanguage": True,
+            "isIpCreatePosition": True,
+            "isIpCountry": True,
+        }
+    }
+    proxy_url = os.environ.get(
+        "CLASH_PROXY", "http://127.0.0.1:7897"
+    ).strip()
+    if not proxy_url or proxy_url.lower() in {"none", "off", "direct"}:
+        return options
+    parsed = urlparse(proxy_url if "://" in proxy_url else f"http://{proxy_url}")
+    if not parsed.hostname or not parsed.port:
+        return options
+    options.update({
+        "proxyMethod": 2,
+        "proxyType": "http",
+        "host": parsed.hostname,
+        "port": str(parsed.port),
+    })
+    if parsed.username:
+        options["proxyUserName"] = parsed.username
+    if parsed.password:
+        options["proxyPassword"] = parsed.password
+    return options
+
+
 async def validate_key(sk: str, bb: BitBrowser) -> bool:
     """用 BitBrowser 浏览器验证 sessionKey：打开 claude.ai，发一条消息，收到回复才算有效"""
     name = f"validate_{datetime.now().strftime('%H%M%S')}"
     profile_id = None
     try:
-        profile_id = bb.create_browser(name=name)
+        browser_options = validation_browser_options()
+        profile_id = bb.create_browser(name=name, **browser_options)
+        if browser_options.get("proxyType") == "http":
+            print(
+                "  validation window via "
+                f"{browser_options['host']}:{browser_options['port']}"
+            )
         info = bb.open_browser(profile_id)
         ws = info.get("ws", "")
 
